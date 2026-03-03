@@ -8,7 +8,7 @@ import copy
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer & Designer", layout="wide")
 st.title("🏗️ 3D Frame Analysis & Complete Building Design")
-st.caption("Includes: Automated Plan Validation | Combined Footing Auto-Sizing | Mixed Rebar Detailing")
+st.caption("Includes: Automated Plan Validation | Auto-Sizing | Mixed Rebar | Bar Bending Schedule (BBS)")
 
 # --- INITIALIZE STATE ---
 if 'grids' not in st.session_state:
@@ -76,8 +76,6 @@ sbc = st.sidebar.number_input("Safe Bearing Capacity (kN/m²)", value=150.0, ste
 
 st.sidebar.header("5. Engine Settings")
 apply_cracked_modifiers = st.sidebar.checkbox("Use IS 1893 Cracked Sections", value=True)
-show_nodes = st.sidebar.checkbox("Show Node Numbers in 3D", value=False)
-show_members = st.sidebar.checkbox("Show Member IDs in 3D", value=False)
 
 st.sidebar.header("6. IS Code Combinations")
 combo = st.sidebar.selectbox("Select Load Combination", [
@@ -139,7 +137,18 @@ def get_rebar_detail(ast_req, member_type="Beam"):
         if c[4] >= ast_req:
             if c[2] == 0: return f"{c[0]}-T{c[1]} (Prv: {int(c[4])})"
             else: return f"{c[0]}-T{c[1]} + {c[2]}-T{c[3]} (Prv: {int(c[4])})"
-    return "Custom (High Ast)"
+    return "Custom"
+
+def parse_rebar_string(rebar_str):
+    """Parses '4-T16 + 2-T12 (Prv: 1030)' back into list of tuples [(4, 16), (2, 12)]"""
+    if "Prv" not in str(rebar_str): return []
+    clean = rebar_str.split(" (Prv")[0]
+    bars = []
+    for part in clean.split(" + "):
+        if "-T" in part:
+            n, d = part.split("-T")
+            bars.append((int(n), int(d)))
+    return bars
 
 # --- IS 456 DESIGN FUNCTIONS ---
 def design_beam_is456(b_m, h_m, Mu_kNm, Vu_kN, fck, fy):
@@ -250,29 +259,6 @@ def build_mesh():
 
 nodes, elements, diaphragm_nodes = build_mesh()
 
-# --- RENDER 3D MODEL WITH ANNOTATIONS ---
-st.subheader("🖥️ 3D Architectural Viewport")
-fig = go.Figure()
-for el in elements:
-    if el['type'] == 'Diaphragm': continue
-    ni = next(n for n in nodes if n['id'] == el['ni'])
-    nj = next(n for n in nodes if n['id'] == el['nj'])
-    color = '#1f77b4' if el['type'] == 'Column' else '#d62728'
-    fig.add_trace(go.Scatter3d(x=[ni['x'], nj['x']], y=[ni['y'], nj['y']], z=[ni['z'], nj['z']], mode='lines', line=dict(color=color, width=4), hoverinfo='text', text=f"ID: {el['id']}", showlegend=False))
-    
-    if show_members:
-        fig.add_trace(go.Scatter3d(x=[(ni['x']+nj['x'])/2], y=[(ni['y']+nj['y'])/2], z=[(ni['z']+nj['z'])/2], mode='text', text=[f"M{el['id']}"], textfont=dict(color='green', size=10), showlegend=False, hoverinfo='none'))
-
-phy_nodes = [n for n in nodes if not n['is_dummy']]
-fig.add_trace(go.Scatter3d(x=[n['x'] for n in phy_nodes], y=[n['y'] for n in phy_nodes], z=[n['z'] for n in phy_nodes], mode='markers', marker=dict(size=3, color='black'), hoverinfo='none', showlegend=False))
-
-if show_nodes:
-    fig.add_trace(go.Scatter3d(x=[n['x'] for n in phy_nodes], y=[n['y'] for n in phy_nodes], z=[n['z'] for n in phy_nodes], mode='text', text=[f"N{n['id']}" for n in phy_nodes], textfont=dict(color='purple', size=10), textposition="top center", showlegend=False, hoverinfo='none'))
-
-fig.update_layout(scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'), margin=dict(l=0, r=0, b=0, t=0), height=500)
-st.plotly_chart(fig, width="stretch")
-
-# --- ENGINE: MATHS & SOLVER ---
 def calc_yield_line_udl(ni, nj, el_dir, q_area):
     L_beam = math.sqrt((nj['x']-ni['x'])**2 + (nj['y']-ni['y'])**2)
     if L_beam < 0.1: return 0.0
@@ -339,8 +325,8 @@ def transform_matrix(ni, nj, angle_deg):
 
 st.divider()
 
-if st.button("🚀 Execute Analysis & Grouped Design", type="primary", width="stretch"):
-    with st.spinner("Processing Matrix, Extracting Forces & Detailing Members..."):
+if st.button("🚀 Execute Validation, Design & Generate BBS", type="primary", width="stretch"):
+    with st.spinner("Processing Global Matrix, Sizing Members & Detailing Rebar..."):
         ndof = len(nodes) * 6
         K_global = np.zeros((ndof, ndof))
         F_global = np.zeros(ndof)
@@ -411,6 +397,7 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", width="st
         # Post-Processing
         analysis_data, design_data = [], []
         base_reactions = {}
+        bbs_records = []
 
         for el in elements:
             if el['type'] == 'Diaphragm': continue
@@ -431,10 +418,7 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", width="st
                     moment_max = max(moment_max, abs(f_int[5] + (Vy_i * x_max) - (0.5 * w * x_max**2)))
 
             if el['type'] == 'Column' and el['ni_n']['z'] == 0:
-                base_reactions[el['ni_n']['id']] = {
-                    'Pu': abs(f_int[0]), 'Col_Size': el['size'],
-                    'x': el['ni_n']['x'], 'y': el['ni_n']['y']
-                }
+                base_reactions[el['ni_n']['id']] = {'Pu': abs(f_int[0]), 'Col_Size': el['size'], 'x': el['ni_n']['x'], 'y': el['ni_n']['y']}
 
             analysis_data.append({
                 "Member ID": f"M{el['id']}", "Type": el['type'], "Floor": el['ni_n']['floor'],
@@ -445,20 +429,51 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", width="st
             b_m, h_m = map(lambda x: float(x)/1000.0, el['size'].split('x'))
             if el['type'] == 'Beam':
                 req_ast, stat = design_beam_is456(b_m, h_m, moment_max, shear, fck, fy)
+                rebar_str = get_rebar_detail(req_ast, "Beam")
             else:
                 req_ast, stat = design_column_is456(b_m, h_m, axial, moment_max, fck, fy)
+                rebar_str = get_rebar_detail(req_ast, "Column")
                 
             design_data.append({
                 "Member ID": f"M{el['id']}", "Type": el['type'], "Floor": el['ni_n']['floor'],
                 "Size (mm)": el['size'], "Max Pu (kN)": round(axial, 1), "Max Mu (kN.m)": round(moment_max, 1),
-                "Req Ast (mm²)": req_ast, "Status": stat
+                "Req Ast (mm²)": req_ast, "Provided Rebar": rebar_str, "Status": stat
+            })
+
+            # --- GENERATE BBS FOR THIS MEMBER ---
+            parsed_bars = parse_rebar_string(rebar_str)
+            for (count, dia) in parsed_bars:
+                if el['type'] == 'Beam':
+                    cut_L = el['L'] - (2 * 0.025) + (2 * 50 * dia/1000.0) # Length - covers + anchorage
+                else:
+                    cut_L = el['L'] + (50 * dia/1000.0) # Column height + lap
+                
+                wt = (dia**2 / 162.0) * cut_L * count
+                bbs_records.append({
+                    "Element": f"M{el['id']} ({el['type']})", "Location": f"Floor {el['ni_n']['floor']}",
+                    "Bar Type": "Main longitudinal", "Dia (mm)": dia, "No. Bars": count,
+                    "Cut Length (m)": round(cut_L, 2), "Total Wt (kg)": round(wt, 2)
+                })
+            
+            # Stirrups/Ties
+            if el['type'] == 'Beam':
+                s_cut = 2*(b_m - 0.05 + h_m - 0.05) + (24 * 0.008)
+                n_st = int(el['L'] / 0.15) + 1
+            else:
+                s_cut = 2*(b_m - 0.08 + h_m - 0.08) + (24 * 0.008)
+                n_st = int(el['L'] / 0.15) + 1
+            wt_st = (8**2 / 162.0) * s_cut * n_st
+            bbs_records.append({
+                "Element": f"M{el['id']} ({el['type']})", "Location": f"Floor {el['ni_n']['floor']}",
+                "Bar Type": "Stirrup/Tie (8mm @ 150c/c)", "Dia (mm)": 8, "No. Bars": n_st,
+                "Cut Length (m)": round(s_cut, 2), "Total Wt (kg)": round(wt_st, 2)
             })
 
         df_analysis = pd.DataFrame(analysis_data)
         df_design = pd.DataFrame(design_data)
         
         # --- TABULAR PRESENTATION ---
-        tab1, tab2, tab3 = st.tabs(["📊 Raw Internal Forces", "📐 Detailed Reinforcement", "🟦 Slabs & Footings"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Forces", "📐 Main Design", "🟦 Slabs & Footings", "🧾 Bar Bending Schedule"])
         
         with tab1:
             st.markdown("### Individual Member Internal Forces")
@@ -466,8 +481,6 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", width="st
             
         with tab2:
             st.markdown("### IS 456 Grouped Design & Rebar Combinations")
-            st.info("Members are grouped to find the critical force envelope. The algorithm selects practical, site-ready rebar combinations.")
-            
             df_col = df_design[df_design['Type'] == 'Column']
             if not df_col.empty:
                 col_group = df_col.groupby(['Floor', 'Size (mm)']).agg(
@@ -487,7 +500,7 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", width="st
                 st.dataframe(beam_group, width="stretch")
                 
         with tab3:
-            st.markdown("### IS 456 Two-Way Slab Spacing Check")
+            # --- SLAB & FOOTING CALCULATION ---
             x_spans = [x_coords_sorted[i+1] - x_coords_sorted[i] for i in range(len(x_coords_sorted)-1) if (x_coords_sorted[i+1] - x_coords_sorted[i]) > 0.1]
             y_spans = [y_coords_sorted[i+1] - y_coords_sorted[i] for i in range(len(y_coords_sorted)-1) if (y_coords_sorted[i+1] - y_coords_sorted[i]) > 0.1]
             Lx = max(min(x_spans) if x_spans else 1.0, 0.001)
@@ -495,126 +508,98 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", width="st
             
             ratio = Ly / Lx
             alpha_x = np.interp(ratio, [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0], [0.062, 0.074, 0.084, 0.093, 0.099, 0.104, 0.113, 0.118]) if ratio <= 2.0 else 0.125
-            
             w_u_slab = 1.5 * (live_load + floor_finish + (slab_thick/1000.0)*25.0)
             Mu_slab = alpha_x * w_u_slab * (Lx**2)
             d_eff_slab = max(slab_thick - 25, 1.0)
             
             sqrt_term = max(1 - (4.6 * Mu_slab * 1e6) / (max(fck, 1.0) * 1000 * d_eff_slab**2), 0)
             Ast_req_slab = (0.5 * fck / max(fy, 1.0)) * (1 - math.sqrt(sqrt_term)) * 1000 * d_eff_slab
-            Ast_min_slab = 0.0012 * 1000 * slab_thick
-            Ast_slab = max(Ast_req_slab, Ast_min_slab)
-            
+            Ast_slab = max(Ast_req_slab, 0.0012 * 1000 * slab_thick)
             slab_spacing = min(math.floor(1000 / (Ast_slab / 78.5) / 10)*10, 300) 
-            d_req_flex = math.sqrt((Mu_slab * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * 1000))
-            d_req_def = (Lx * 1000) / 28.0 
             
-            safe_slab = slab_thick >= max(d_req_flex, d_req_def) + 25
+            # --- BBS: Slab Addition ---
+            num_main = int(Ly / (slab_spacing/1000.0)) + 1
+            main_len = Lx + (2 * 50 * 10/1000.0)
+            wt_main = (10**2 / 162.0) * main_len * num_main
             
-            st.write(f"- **Critical Panel:** {round(Lx,2)}m x {round(Ly,2)}m ({'Two-Way' if ratio <= 2.0 else 'One-Way'})")
-            st.write(f"- **Max Factored Moment:** {round(Mu_slab, 2)} kN.m")
-            st.write(f"- **Required Thickness:** {round(max(d_req_flex, d_req_def)+25, 1)} mm | **Provided:** {slab_thick} mm")
+            num_dist = int(Lx / 0.20) + 1 # Distribution @ 200 c/c
+            dist_len = Ly + (2 * 50 * 10/1000.0)
+            wt_dist = (10**2 / 162.0) * dist_len * num_dist
             
-            if safe_slab: 
-                st.success(f"✅ Slab is Safe. **Main Reinforcement (Bottom): T10 @ {int(slab_spacing)} mm c/c**")
-            else: 
-                st.error("❌ Slab Thickness Fails Deflection/Flexure limits. Increase Thickness.")
+            for flr in range(1, len(floors_df)+1):
+                bbs_records.append({"Element": "Floor Slab", "Location": f"Floor {flr}", "Bar Type": "Main (T10)", "Dia (mm)": 10, "No. Bars": num_main, "Cut Length (m)": round(main_len,2), "Total Wt (kg)": round(wt_main,2)})
+                bbs_records.append({"Element": "Floor Slab", "Location": f"Floor {flr}", "Bar Type": "Dist (T10 @ 200c/c)", "Dia (mm)": 10, "No. Bars": num_dist, "Cut Length (m)": round(dist_len,2), "Total Wt (kg)": round(wt_dist,2)})
+
+            st.markdown("### IS 456 Two-Way Slab Check")
+            st.write(f"- **Critical Panel:** {round(Lx,2)}m x {round(Ly,2)}m")
+            st.success(f"✅ **Main Slab Mesh:** T10 @ {int(slab_spacing)} mm c/c")
             
             st.divider()
-
-            # --- ISOLATED FOOTING SIZING & GEOMETRIC COLLECTION ---
-            footing_geoms = {}
-            footing_results = []
             
+            st.markdown("### Foundation Validation & Footing Design")
+            footing_geoms, footing_results = {}, []
             for nid, data in base_reactions.items():
                 P_service = data['Pu'] / 1.5
-                Area_req = (P_service * 1.1) / max(sbc, 1.0)
-                Side_L = max(math.ceil(math.sqrt(Area_req) * 10) / 10.0, 1.0)
+                Side_L = max(math.ceil(math.sqrt((P_service * 1.1) / max(sbc, 1.0)) * 10) / 10.0, 1.0)
+                footing_geoms[nid] = {'x': data['x'], 'y': data['y'], 'L': Side_L, 'Pu': data['Pu']}
                 
-                footing_geoms[nid] = {
-                    'x': data['x'], 'y': data['y'], 
-                    'L': Side_L, 'Pu': data['Pu']
-                }
+                col_b, col_h = map(lambda x: float(x)/1000.0, data['Col_Size'].split('x'))
+                net_upward = data['Pu'] / (Side_L**2)
+                proj_x = max((Side_L - max(col_b, col_h)) / 2.0, 0.01)
+                Mu_footing = net_upward * Side_L * (proj_x**2) / 2.0
+                d_req_flex = math.sqrt((Mu_footing * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * (Side_L*1000)))
                 
-                net_upward_p = data['Pu'] / (Side_L**2)
-                col_c = max(map(float, data['Col_Size'].split('x'))) / 1000.0
-                proj_x = max((Side_L - col_c) / 2.0, 0.01)
-                Mu_footing = net_upward_p * Side_L * (proj_x**2) / 2.0
+                D_prov = max(300, math.ceil((d_req_flex + 50) / 50.0) * 50)
+                d_eff = D_prov - 50 
+                while True:
+                    d_m = d_eff / 1000.0
+                    b0 = 2 * ((col_b + d_m) + (col_h + d_m))
+                    A_punch = (col_b + d_m) * (col_h + d_m)
+                    V_punch = data['Pu'] - (net_upward * A_punch)
+                    tau_v = (V_punch * 1000) / (b0 * 1000 * d_eff) if b0 > 0 else 0
+                    tau_c = min(0.5 + (min(col_b, col_h) / max(col_b, col_h)), 1.0) * 0.25 * math.sqrt(max(fck, 1.0))
+                    if tau_v <= tau_c: break
+                    D_prov += 50
+                    d_eff = D_prov - 50
                 
-                d_req_footing = math.sqrt((Mu_footing * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * (Side_L*1000)))
-                D_prov = max(300, math.ceil((d_req_footing + 50) / 50.0) * 50)
-                d_eff_footing = max(D_prov - 50, 1.0)
-                
-                sqrt_ftg = max(1 - (4.6 * Mu_footing * 1e6) / (max(fck, 1.0) * (Side_L*1000) * d_eff_footing**2), 0)
-                Ast_req_ftg = (0.5 * fck / max(fy, 1.0)) * (1 - math.sqrt(sqrt_ftg)) * (Side_L*1000) * d_eff_footing
-                Ast_min_ftg = 0.0012 * (Side_L*1000) * D_prov
-                Ast_ftg = max(Ast_req_ftg, Ast_min_ftg)
-                
-                ast_per_meter = Ast_ftg / Side_L
-                ftg_spacing = min(math.floor(1000 / (ast_per_meter / 113.1) / 10)*10, 300)
+                Ast_req_ftg = (0.5 * fck / max(fy, 1.0)) * (1 - math.sqrt(max(1 - (4.6 * Mu_footing * 1e6) / (max(fck, 1.0) * (Side_L*1000) * d_eff**2), 0))) * (Side_L*1000) * d_eff
+                Ast_ftg = max(Ast_req_ftg, 0.0012 * (Side_L*1000) * D_prov)
+                ftg_spacing = min(math.floor(1000 / ((Ast_ftg / Side_L) / 113.1) / 10)*10, 300)
                 
                 footing_results.append({
-                    "Node ID": f"N{nid}",
-                    "Factored Pu (kN)": round(data['Pu'], 1),
-                    "Footing Size (m)": f"{Side_L} x {Side_L}",
-                    "Pad Depth (mm)": int(D_prov),
+                    "Node ID": f"N{nid}", "Factored Pu (kN)": round(data['Pu'], 1),
+                    "Footing Size (m)": f"{Side_L} x {Side_L}", "Pad Depth (mm)": int(D_prov),
+                    "Gov. By": "Punching Shear" if D_prov > max(300, math.ceil((d_req_flex+50)/50.0)*50) else "Flexure",
                     "Base Mesh (B/W)": f"T12 @ {int(ftg_spacing)} c/c"
                 })
-
-            st.markdown("### 1. Isolated Pad Footings (Based on SBC)")
-            st.info(f"Using Unfactored Service Loads (Pu / 1.5) + 10% Self-Weight against SBC = {sbc} kN/m²")
-            st.dataframe(pd.DataFrame(footing_results), width="stretch")
-
-            st.divider()
-
-            # --- NEW: CLASH DETECTION & COMBINED FOOTING ENGINE ---
-            st.markdown("### 2. 🕵️ Foundation Plan Validation (Clash Detection)")
-            clashes = []
-            processed_nodes = set()
-            combined_footing_results = []
-            
+                
+                # --- BBS: Footing Addition ---
+                num_ftg_bars = int((Side_L - 0.1) / (ftg_spacing/1000.0)) + 1
+                ftg_cut_len = (Side_L - 0.1) + 2*(D_prov/1000.0 - 0.1)
+                wt_ftg = (12**2 / 162.0) * ftg_cut_len * (num_ftg_bars * 2) # Both ways
+                bbs_records.append({"Element": f"Footing N{nid}", "Location": "Foundation", "Bar Type": "Base Mesh (Both Ways)", "Dia (mm)": 12, "No. Bars": num_ftg_bars*2, "Cut Length (m)": round(ftg_cut_len,2), "Total Wt (kg)": round(wt_ftg,2)})
+                
+            clashes, processed = [], set()
             node_ids = list(footing_geoms.keys())
             for i in range(len(node_ids)):
                 for j in range(i+1, len(node_ids)):
                     n1, n2 = node_ids[i], node_ids[j]
-                    if n1 in processed_nodes or n2 in processed_nodes:
-                        continue
-                    
+                    if n1 in processed or n2 in processed: continue
                     f1, f2 = footing_geoms[n1], footing_geoms[n2]
                     dist = math.hypot(f1['x'] - f2['x'], f1['y'] - f2['y'])
-                    req_dist = (f1['L'] / 2.0) + (f2['L'] / 2.0)
-                    
-                    if dist < req_dist:
-                        clashes.append((n1, n2))
-                        processed_nodes.add(n1)
-                        processed_nodes.add(n2)
-                        
-                        # CG Balancing & Rectangular Combine Logic
-                        P1, P2 = f1['Pu'], f2['Pu']
-                        P_tot_service = (P1 + P2) / 1.5
-                        Area_req = (P_tot_service * 1.1) / max(sbc, 1.0)
-                        
-                        CG_dist = (P2 * dist) / max(P1 + P2, 1.0)
-                        
-                        # Minimum edge clearance assumed 0.5m past column centerline
-                        half_L = max(CG_dist, dist - CG_dist) + 0.5
-                        L_comb = max(math.ceil((2 * half_L) * 10) / 10.0, 1.0)
-                        B_comb = max(math.ceil((Area_req / L_comb) * 10) / 10.0, 1.0)
-                        
-                        status = "Combined Rectangular"
-                        if B_comb > L_comb * 1.5:
-                            status = "Requires Raft/Mat"
-                            
-                        combined_footing_results.append({
-                            "Clashing Nodes": f"N{n1} & N{n2}",
-                            "Dist Between Cols (m)": round(dist, 2),
-                            "Total Service Load (kN)": round(P_tot_service, 1),
-                            "Combined L x B (m)": f"{L_comb} x {B_comb}",
-                            "Design Recommendation": status
-                        })
-
+                    if dist < (f1['L'] / 2.0) + (f2['L'] / 2.0):
+                        clashes.append((n1, n2)); processed.add(n1); processed.add(n2)
             if not clashes:
-                st.success("✅ Foundation Validation Passed: All isolated footings have adequate spatial clearance. No overlapping soil pressure bulbs detected.")
+                st.success("✅ Foundation Validation Passed: No overlapping soil pressure bulbs.")
+                st.dataframe(pd.DataFrame(footing_results), width="stretch")
             else:
-                st.error(f"🚨 Validation Failed: {len(clashes)} footing clash(es) detected. Overlapping soil pressure zones will cause severe differential settlement. Implementing Combined Footing solutions.")
-                st.dataframe(pd.DataFrame(combined_footing_results), width="stretch")
+                st.error(f"🚨 {len(clashes)} Clash(es) Detected. Footings overlap. Use Combined or Raft Foundation.")
+                
+        with tab4:
+            st.markdown("### 🧾 Comprehensive Bar Bending Schedule (BBS)")
+            df_bbs = pd.DataFrame(bbs_records)
+            st.dataframe(df_bbs, width="stretch")
+            
+            total_wt_kg = df_bbs['Total Wt (kg)'].sum()
+            st.metric(label="Total Steel Tonnage Required", value=f"{total_wt_kg / 1000.0:.2f} Metric Tons")
+            st.download_button(label="⬇️ Download BBS (CSV)", data=df_bbs.to_csv(index=False), file_name="building_bbs.csv", mime="text/csv", width="stretch")
