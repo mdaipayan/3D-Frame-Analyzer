@@ -532,26 +532,62 @@ if st.button("🚀 Execute Analysis & Extract Design Detailing", type="primary",
             else: 
                 st.error("❌ Slab Thickness Fails Deflection/Flexure limits. Increase Thickness.")
             
-            st.markdown("### Isolated Pad Footings Detail (Based on SBC)")
-            st.info(f"Using Unfactored Service Loads (Pu / 1.5) + 10% Self-Weight against SBC = {sbc} kN/m²")
+            # FOOTING DESIGN (UPGRADED WITH PUNCHING SHEAR)
+            st.markdown("### Isolated Pad Footings (Flexure & Punching Shear Check)")
+            st.info(f"Sizes based on SBC = {sbc} kN/m². Depths optimized for Two-Way Punching Shear (IS 456).")
             
             footing_results = []
             for nid, data in base_reactions.items():
+                # 1. Size the Pad Area (Serviceability)
                 P_service = data['Pu'] / 1.5
                 Area_req = (P_service * 1.1) / max(sbc, 1.0)
                 Side_L = max(math.ceil(math.sqrt(Area_req) * 10) / 10.0, 1.0)
                 
-                net_upward_p = data['Pu'] / (Side_L**2)
-                col_c = max(map(float, data['Col_Size'].split('x'))) / 1000.0
-                proj_x = max((Side_L - col_c) / 2.0, 0.01)
+                # Column dimensions (m)
+                col_b, col_h = map(lambda x: float(x)/1000.0, data['Col_Size'].split('x'))
+                
+                net_upward_p = data['Pu'] / (Side_L**2) # kN/m²
+                
+                # 2. Initial Depth based on Flexure
+                proj_x = max((Side_L - max(col_b, col_h)) / 2.0, 0.01)
                 Mu_footing = net_upward_p * Side_L * (proj_x**2) / 2.0
+                d_req_flex = math.sqrt((Mu_footing * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * (Side_L*1000)))
                 
-                d_req_footing = math.sqrt((Mu_footing * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * (Side_L*1000)))
-                D_prov = max(300, math.ceil((d_req_footing + 50) / 50.0) * 50)
-                d_eff_footing = max(D_prov - 50, 1.0)
+                # 3. ITERATIVE PUNCHING SHEAR CHECK (Two-Way Shear at d/2)
+                D_prov = max(300, math.ceil((d_req_flex + 50) / 50.0) * 50)
+                d_eff = D_prov - 50 # effective depth in mm
                 
-                sqrt_ftg = max(1 - (4.6 * Mu_footing * 1e6) / (max(fck, 1.0) * (Side_L*1000) * d_eff_footing**2), 0)
-                Ast_req_ftg = (0.5 * fck / max(fy, 1.0)) * (1 - math.sqrt(sqrt_ftg)) * (Side_L*1000) * d_eff_footing
+                while True:
+                    d_m = d_eff / 1000.0 # d in meters
+                    
+                    # Critical perimeter b0 at d/2 from column face
+                    c_x = col_b + d_m
+                    c_y = col_h + d_m
+                    b0 = 2 * (c_x + c_y) # meters
+                    
+                    # Punching Area
+                    A_punching = c_x * c_y
+                    
+                    # Punching Force (Total load minus upward soil pressure directly under column)
+                    V_punch = data['Pu'] - (net_upward_p * A_punching)
+                    
+                    # Punching Shear Stress (MPa)
+                    tau_v = (V_punch * 1000) / (b0 * 1000 * d_eff) if b0 > 0 else 0
+                    
+                    # Permissible Punching Shear (IS 456: ks * 0.25 * sqrt(fck))
+                    ks = min(0.5 + (min(col_b, col_h) / max(col_b, col_h)), 1.0)
+                    tau_c = ks * 0.25 * math.sqrt(fck)
+                    
+                    if tau_v <= tau_c:
+                        break # Safe! Exit loop.
+                    else:
+                        # Fails punching shear. Increase depth by 50mm and recalculate.
+                        D_prov += 50
+                        d_eff = D_prov - 50
+                
+                # 4. Final Steel Calculation using the Safe Depth
+                sqrt_ftg = max(1 - (4.6 * Mu_footing * 1e6) / (max(fck, 1.0) * (Side_L*1000) * d_eff**2), 0)
+                Ast_req_ftg = (0.5 * fck / max(fy, 1.0)) * (1 - math.sqrt(sqrt_ftg)) * (Side_L*1000) * d_eff
                 Ast_min_ftg = 0.0012 * (Side_L*1000) * D_prov
                 Ast_ftg = max(Ast_req_ftg, Ast_min_ftg)
                 
@@ -563,6 +599,7 @@ if st.button("🚀 Execute Analysis & Extract Design Detailing", type="primary",
                     "Factored Pu (kN)": round(data['Pu'], 1),
                     "Footing Size (m)": f"{Side_L} x {Side_L}",
                     "Pad Depth (mm)": int(D_prov),
+                    "Gov. By": "Punching Shear" if D_prov > max(300, math.ceil((d_req_flex + 50) / 50.0) * 50) else "Flexure",
                     "Base Mesh (B/W)": f"T12 @ {int(ftg_spacing)} c/c"
                 })
                 
