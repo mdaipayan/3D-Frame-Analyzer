@@ -10,7 +10,7 @@ import base64
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer & Designer", layout="wide")
 st.title("🏗️ 3D Frame Analysis & Complete Building Design")
-st.caption("Audited: 3D Viewport | PDF Export | Dynamic Shear | Mixed Rebar | BBS")
+st.caption("Audited: 3D Viewport | Interactive Tabs | PDF Export | Dynamic Shear | BBS")
 
 # --- INITIALIZE STATE ---
 if 'grids' not in st.session_state:
@@ -283,7 +283,6 @@ def build_mesh():
 
 nodes, elements, diaphragm_nodes = build_mesh()
 
-# --- THE RESTORED 3D VIEWPORT ---
 st.subheader("🖥️ 3D Architectural Viewport")
 fig = go.Figure()
 for el in elements:
@@ -301,7 +300,6 @@ if show_nodes:
 
 fig.update_layout(scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'), margin=dict(l=0, r=0, b=0, t=0), height=500)
 st.plotly_chart(fig, width="stretch")
-# ---------------------------------
 
 def calc_yield_line_udl(ni, nj, el_dir, q_area):
     L_beam = math.sqrt((nj['x']-ni['x'])**2 + (nj['y']-ni['y'])**2)
@@ -366,7 +364,7 @@ def transform_matrix(ni, nj, angle_deg):
 st.divider()
 
 if st.button("🚀 Execute Analysis & Generate Production PDF", type="primary", width="stretch"):
-    with st.spinner("Solving Matrix, Running IS 456 Checks & Writing PDF Report..."):
+    with st.spinner("Solving Matrix, Running IS Checks, Writing PDF & UI Tabs..."):
         ndof = len(nodes) * 6
         K_global = np.zeros((ndof, ndof))
         F_global = np.zeros(ndof)
@@ -471,7 +469,7 @@ if st.button("🚀 Execute Analysis & Generate Production PDF", type="primary", 
             n_st = int(el['L'] / (sv_mm / 1000.0)) + 1
             bbs_records.append({"Element": f"M{el['id']}", "Type": "Tie/Stirrup", "Dia": 8, "No": n_st, "Cut L(m)": round(s_cut, 2), "Wt(kg)": round((8**2/162.0)*s_cut*n_st, 2)})
 
-        # SLAB & FOOTING
+        # --- SLAB CHECK & FOOTING DESIGN ---
         x_spans = [x_coords_sorted[i+1] - x_coords_sorted[i] for i in range(len(x_coords_sorted)-1) if (x_coords_sorted[i+1] - x_coords_sorted[i]) > 0.1]
         y_spans = [y_coords_sorted[i+1] - y_coords_sorted[i] for i in range(len(y_coords_sorted)-1) if (y_coords_sorted[i+1] - y_coords_sorted[i]) > 0.1]
         Lx, Ly = max(min(x_spans) if x_spans else 1.0, 0.001), max(max(y_spans) if y_spans else 1.0, 0.001)
@@ -485,6 +483,10 @@ if st.button("🚀 Execute Analysis & Generate Production PDF", type="primary", 
         spc_neg = min(math.floor(1000 / (max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_neg*1e6)/(max(fck,1.0)*1000*d_eff_slab**2),0)))*1000*d_eff_slab, 0.0012*1000*slab_thick) / 78.5) / 10)*10, 300) 
         spc_tor = min(math.floor(1000 / (0.75 * max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_pos*1e6)/(max(fck,1.0)*1000*d_eff_slab**2),0)))*1000*d_eff_slab, 0.0012*1000*slab_thick) / 78.5) / 10)*10, 300)
         
+        d_req_flex = math.sqrt((max(Mu_pos, Mu_neg) * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * 1000))
+        d_req_def = (Lx * 1000) / 28.0 
+        safe_slab = slab_thick >= max(d_req_flex, d_req_def) + 25
+
         for flr in range(1, len(floors_df)+1):
             n_main, l_main = int(Ly / (spc_pos/1000.0)) + 1, Lx + 1.0
             n_dist, l_dist = int(Lx / 0.20) + 1, Ly + 1.0
@@ -495,10 +497,11 @@ if st.button("🚀 Execute Analysis & Generate Production PDF", type="primary", 
             n_tor = int((Lx/5.0) / (spc_tor/1000.0)) * 2 
             bbs_records.append({"Element": f"Slab F{flr}", "Type": "Corner Tor", "Dia": 10, "No": n_tor*4, "Cut L(m)": round(Lx/5.0,2), "Wt(kg)": round((10**2/162.0)*(Lx/5.0)*(n_tor*4),2)})
 
-        footing_results = []
+        footing_geoms, footing_results = {}, []
         for nid, data in base_reactions.items():
             P_service = data['Pu'] / 1.5
             Side_L = max(math.ceil(math.sqrt((P_service * 1.1) / max(sbc, 1.0)) * 10) / 10.0, 1.0)
+            footing_geoms[nid] = {'x': data['x'], 'y': data['y'], 'L': Side_L}
             col_b, col_h = map(lambda x: float(x)/1000.0, data['Col_Size'].split('x'))
             net_upward = data['Pu'] / (Side_L**2)
             Mu_footing = net_upward * Side_L * (max((Side_L - max(col_b, col_h)) / 2.0, 0.01)**2) / 2.0
@@ -514,6 +517,17 @@ if st.button("🚀 Execute Analysis & Generate Production PDF", type="primary", 
             footing_results.append({"Node": f"N{nid}", "P(kN)": round(data['Pu'], 1), "Size": f"{Side_L}x{Side_L}", "D(mm)": int(D_prov), "Mesh": f"T12@{int(ftg_spacing)}"})
             num_ftg, l_ftg = int((Side_L - 0.1) / (ftg_spacing/1000.0)) + 1, (Side_L - 0.1) + 2*(D_prov/1000.0 - 0.1)
             bbs_records.append({"Element": f"Foot N{nid}", "Type": "Base Mesh", "Dia": 12, "No": num_ftg*2, "Cut L(m)": round(l_ftg,2), "Wt(kg)": round((12**2/162.0)*l_ftg*(num_ftg*2),2)})
+
+        clashes, processed = [], set()
+        node_ids = list(footing_geoms.keys())
+        for i in range(len(node_ids)):
+            for j in range(i+1, len(node_ids)):
+                n1, n2 = node_ids[i], node_ids[j]
+                if n1 in processed or n2 in processed: continue
+                f1, f2 = footing_geoms[n1], footing_geoms[n2]
+                dist = math.hypot(f1['x'] - f2['x'], f1['y'] - f2['y'])
+                if dist < (f1['L'] / 2.0) + (f2['L'] / 2.0):
+                    clashes.append((n1, n2)); processed.add(n1); processed.add(n2)
 
         # --- GENERATE PDF REPORT ---
         pdf = PDFReport()
@@ -534,12 +548,47 @@ if st.button("🚀 Execute Analysis & Generate Production PDF", type="primary", 
         pdf.build_table(df_bbs)
         
         pdf.set_font('Arial', 'B', 12)
-        pdf.cell(0, 10, f'TOTAL STEEL TONNAGE REQUIRED: {df_bbs["Wt(kg)"].sum() / 1000.0:.2f} Metric Tons', 0, 1, 'R')
+        total_wt_kg = df_bbs["Wt(kg)"].sum()
+        pdf.cell(0, 10, f'TOTAL STEEL TONNAGE REQUIRED: {total_wt_kg / 1000.0:.2f} Metric Tons', 0, 1, 'R')
 
         pdf_bytes = pdf.output(dest='S').encode('latin-1')
 
-        # --- UI DISPLAY ---
+        # --- THE RESTORED INTERACTIVE UI TABS ---
         st.success("✅ Analysis & Code Checks Complete! Download the Production Report below.")
         st.download_button(label="📄 Download Production PDF Report", data=pdf_bytes, file_name="Structural_Detailing_Report.pdf", mime="application/pdf", type="primary", width="stretch")
         
-        st.dataframe(pd.DataFrame(design_data), width="stretch")
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Raw Forces", "📐 Main Detailing", "🟦 Slabs & Footings", "🧾 Bar Bending Schedule"])
+        
+        with tab1:
+            st.markdown("### Individual Member Internal Forces")
+            st.dataframe(pd.DataFrame(analysis_data), width="stretch")
+            
+        with tab2:
+            st.markdown("### IS 456 Dynamic Shear & Rebar Layout")
+            st.dataframe(pd.DataFrame(design_data), width="stretch")
+                
+        with tab3:
+            st.markdown("### IS 456 Restrained Two-Way Slab Check")
+            st.write(f"- **Critical Panel:** {round(Lx,2)}m x {round(Ly,2)}m | **Max Hogging Moment:** {round(Mu_neg, 2)} kN.m")
+            st.write(f"- **Required Thickness:** {round(max(d_req_flex, d_req_def)+25, 1)} mm | **Provided:** {slab_thick} mm")
+            
+            if safe_slab: 
+                st.success(f"✅ Slab Safe. \n- **Bot Span Mesh:** T10 @ {int(spc_pos)} c/c\n- **Top Support (Hogging):** T10 @ {int(spc_neg)} c/c\n- **Corner Torsion Mesh:** T10 @ {int(spc_tor)} c/c (over {round(Lx/5.0, 2)}m)")
+            else: 
+                st.error("❌ Slab Fails Deflection or Flexure. Increase Thickness.")
+            
+            st.divider()
+            
+            st.markdown("### Foundation Validation & Isolated Footings")
+            if not clashes:
+                st.success("✅ Foundation Validation Passed: No overlapping soil pressure bulbs.")
+            else:
+                st.error(f"🚨 {len(clashes)} Clash(es) Detected. Footings physically overlap or interact. Use Combined or Raft Foundation.")
+            
+            st.dataframe(pd.DataFrame(footing_results), width="stretch")
+                
+        with tab4:
+            st.markdown("### 🧾 Comprehensive Bar Bending Schedule (BBS)")
+            st.dataframe(df_bbs, width="stretch")
+            st.metric(label="Total Steel Tonnage Required", value=f"{total_wt_kg / 1000.0:.2f} Metric Tons")
+            st.download_button(label="⬇️ Download BBS (CSV)", data=df_bbs.to_csv(index=False), file_name="building_bbs.csv", mime="text/csv", width="stretch")
