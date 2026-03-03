@@ -4,13 +4,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import math
 import copy
+import os
+import tempfile
 from fpdf import FPDF
-import base64
+import ezdxf
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer & Designer", layout="wide")
 st.title("🏗️ 3D Frame Analysis & Complete Building Design")
-st.caption("Audited: 3D Viewport | Interactive Tabs | PDF Export | Dynamic Shear | BBS")
+st.caption("Audited: 3D Viewport | PDF Export | LibreCAD DXF Export | BBS")
 
 # --- INITIALIZE STATE ---
 if 'grids' not in st.session_state:
@@ -363,8 +365,8 @@ def transform_matrix(ni, nj, angle_deg):
 
 st.divider()
 
-if st.button("🚀 Execute Analysis & Generate Production PDF", type="primary", width="stretch"):
-    with st.spinner("Solving Matrix, Running IS Checks, Writing PDF & UI Tabs..."):
+if st.button("🚀 Execute Complete Analysis & Generate CAD / PDF", type="primary", width="stretch"):
+    with st.spinner("Solving Matrix, Running Code Checks & Building CAD Files..."):
         ndof = len(nodes) * 6
         K_global = np.zeros((ndof, ndof))
         F_global = np.zeros(ndof)
@@ -532,31 +534,88 @@ if st.button("🚀 Execute Analysis & Generate Production PDF", type="primary", 
         # --- GENERATE PDF REPORT ---
         pdf = PDFReport()
         pdf.add_page()
-        
         pdf.chapter_title("1. BEAM & COLUMN DETAILING")
         pdf.build_table(pd.DataFrame(design_data))
-        
         pdf.chapter_title("2. FOUNDATION SIZING (PUNCHING SHEAR SAFE)")
         pdf.build_table(pd.DataFrame(footing_results))
-        
         pdf.chapter_title("3. MONOLITHIC TWO-WAY SLAB (IS 456 Annex D)")
         slab_data = [{"Panel": f"{round(Lx,2)}m x {round(Ly,2)}m", "Thickness": f"{slab_thick} mm", "Bot Span Mesh": f"T10 @ {int(spc_pos)} c/c", "Top Hogging": f"T10 @ {int(spc_neg)} c/c", "Corner Torsion": f"T10 @ {int(spc_tor)} c/c"}]
         pdf.build_table(pd.DataFrame(slab_data))
-
         pdf.chapter_title("4. BAR BENDING SCHEDULE (BBS)")
         df_bbs = pd.DataFrame(bbs_records)
         pdf.build_table(df_bbs)
-        
         pdf.set_font('Arial', 'B', 12)
         total_wt_kg = df_bbs["Wt(kg)"].sum()
         pdf.cell(0, 10, f'TOTAL STEEL TONNAGE REQUIRED: {total_wt_kg / 1000.0:.2f} Metric Tons', 0, 1, 'R')
-
         pdf_bytes = pdf.output(dest='S').encode('latin-1')
 
-        # --- THE RESTORED INTERACTIVE UI TABS ---
-        st.success("✅ Analysis & Code Checks Complete! Download the Production Report below.")
-        st.download_button(label="📄 Download Production PDF Report", data=pdf_bytes, file_name="Structural_Detailing_Report.pdf", mime="application/pdf", type="primary", width="stretch")
+        # --- GENERATE DXF (LibreCAD/AutoCAD) ---
+        doc = ezdxf.new('R2010')
+        msp = doc.modelspace()
+        doc.layers.add('GRIDS', color=8)
+        doc.layers.add('COLUMNS', color=1)
+        doc.layers.add('BEAMS', color=5)
+        doc.layers.add('ANNOTATIONS', color=7)
         
+        max_x = max(x_coords_sorted) if x_coords_sorted else 10
+        max_y = max(y_coords_sorted) if y_coords_sorted else 10
+        offset_x = max_x + 5.0 
+        
+        for idx, row in floors_df.iterrows():
+            f_num = int(row['Floor'])
+            bx = idx * offset_x 
+            
+            msp.add_text(f"FLOOR {f_num} STRUCTURAL FRAMING PLAN", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.4}).set_placement((bx, max_y + 2.0))
+            
+            for _, gx in x_grids_df.iterrows():
+                x = bx + float(gx['X_Coord (m)'])
+                msp.add_line((x, -1.5), (x, max_y + 1.5), dxfattribs={'layer': 'GRIDS'})
+                msp.add_circle((x, max_y + 1.9), radius=0.4, dxfattribs={'layer': 'GRIDS'})
+                msp.add_text(str(gx['Grid_ID']), dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.3}).set_placement((x - 0.12, max_y + 1.75))
+                
+            for _, gy in y_grids_df.iterrows():
+                y = float(gy['Y_Coord (m)'])
+                msp.add_line((bx - 1.5, y), (bx + max_x + 1.5, y), dxfattribs={'layer': 'GRIDS'})
+                msp.add_circle((bx - 1.9, y), radius=0.4, dxfattribs={'layer': 'GRIDS'})
+                msp.add_text(str(gy['Grid_ID']), dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.3}).set_placement((bx - 2.05, y - 0.12))
+                
+            col_b_m, col_h_m = map(lambda val: float(val)/1000.0, col_size.split('x'))
+            f_cols = [el for el in elements if el['type'] == 'Column' and el['nj_n']['floor'] == f_num]
+            for col in f_cols:
+                cx, cy = bx + col['nj_n']['x'], col['nj_n']['y']
+                msp.add_lwpolyline([(cx - col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy - col_h_m/2)], dxfattribs={'layer': 'COLUMNS'})
+                msp.add_text(f"C", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx + col_b_m/2 + 0.1, cy + col_h_m/2 + 0.1))
+                
+            beam_b_m, beam_h_m = map(lambda val: float(val)/1000.0, beam_size.split('x'))
+            f_beams = [el for el in elements if el['type'] == 'Beam' and el['ni_n']['floor'] == f_num]
+            for beam in f_beams:
+                nx1, ny1 = bx + beam['ni_n']['x'], beam['ni_n']['y']
+                nx2, ny2 = bx + beam['nj_n']['x'], beam['nj_n']['y']
+                
+                if abs(ny1 - ny2) < 0.01:
+                    msp.add_line((nx1, ny1 + beam_b_m/2), (nx2, ny2 + beam_b_m/2), dxfattribs={'layer': 'BEAMS'})
+                    msp.add_line((nx1, ny1 - beam_b_m/2), (nx2, ny2 - beam_b_m/2), dxfattribs={'layer': 'BEAMS'})
+                else: 
+                    msp.add_line((nx1 + beam_b_m/2, ny1), (nx2 + beam_b_m/2, ny2), dxfattribs={'layer': 'BEAMS'})
+                    msp.add_line((nx1 - beam_b_m/2, ny1), (nx2 - beam_b_m/2, ny2), dxfattribs={'layer': 'BEAMS'})
+                msp.add_text(f"B", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement(((nx1+nx2)/2 + 0.1, (ny1+ny2)/2 + 0.1))
+
+        fd, path = tempfile.mkstemp(suffix=".dxf")
+        os.close(fd)
+        doc.saveas(path)
+        with open(path, "rb") as f:
+            dxf_bytes = f.read()
+        os.remove(path)
+
+        # --- UI DISPLAY ---
+        st.success("✅ Analysis & Drafting Complete!")
+        
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            st.download_button(label="📄 Download Production PDF Report", data=pdf_bytes, file_name="Structural_Detailing_Report.pdf", mime="application/pdf", type="primary", width="stretch")
+        with col_dl2:
+            st.download_button(label="📥 Download AutoCAD/LibreCAD Plan (.dxf)", data=dxf_bytes, file_name="Floor_Framing_Plans.dxf", mime="application/dxf", type="primary", width="stretch")
+            
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Raw Forces", "📐 Main Detailing", "🟦 Slabs & Footings", "🧾 Bar Bending Schedule"])
         
         with tab1:
