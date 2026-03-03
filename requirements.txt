@@ -4,3 +4,4 @@ scipy
 plotly
 pandas
 fpdf
+ezdxf
