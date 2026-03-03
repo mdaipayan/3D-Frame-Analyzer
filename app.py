@@ -436,13 +436,20 @@ if st.button("🚀 Execute Analysis, Code Checks & Generate BBS", type="primary"
             
             axial = max(abs(f_int[0]), abs(f_int[6]))
             shear = max(abs(f_int[1]), abs(f_int[2]), abs(f_int[7]), abs(f_int[8]))
-            moment_max = max(abs(f_int[5]), abs(f_int[11]))
+            #---moment_max = max(abs(f_int[5]), abs(f_int[11])) #
             torsion_max = max(abs(f_int[3]), abs(f_int[9]))
+            
+            # Distinct Support (Negative) and Span (Positive) Moments
+            Mu_neg_max = max(abs(f_int[5]), abs(f_int[11]))
+            Mu_pos_max = 0.0
             
             if el['type'] == 'Beam' and 'applied_w' in el:
                 w, Vy_i = el['applied_w'], f_int[1] 
                 x_max = Vy_i / max(w, 0.001) if w > 0 else -1
-                if 0 < x_max < el['L']: moment_max = max(moment_max, abs(f_int[5] + (Vy_i * x_max) - (0.5 * w * x_max**2)))
+                if 0 < x_max < el['L']:
+                    # Algebraic max positive moment in span
+                    M_span = f_int[5] + (Vy_i * x_max) - (0.5 * w * x_max**2)
+                    Mu_pos_max = abs(M_span)
 
             if el['type'] == 'Column' and el['ni_n']['z'] == 0:
                 base_reactions[el['ni_n']['id']] = {'Pu': abs(f_int[0]), 'Col_Size': el['size'], 'x': el['ni_n']['x'], 'y': el['ni_n']['y'], 'Vy': shear}
@@ -453,54 +460,54 @@ if st.button("🚀 Execute Analysis, Code Checks & Generate BBS", type="primary"
                 "Shear (kN)": round(shear, 1), "Moment (kN.m)": round(moment_max, 1)
             })
 
-            b_m, h_m = map(lambda x: float(x)/1000.0, el['size'].split('x'))
+b_m, h_m = map(lambda x: float(x)/1000.0, el['size'].split('x'))
             if el['type'] == 'Beam':
-                req_ast, sv_mm, stat = design_beam_is456(b_m, h_m, moment_max, shear, torsion_max, fck, fy)
-                rebar_str = get_rebar_detail(req_ast, "Beam")
+                # PASS BOTH POSITIVE AND NEGATIVE MOMENTS
+                req_ast_bot, req_ast_top, sv_mm, stat = design_beam_is456(b_m, h_m, Mu_pos_max, Mu_neg_max, shear, torsion_max, fck, fy)
+                rebar_bot = get_rebar_detail(req_ast_bot, "Beam")
+                rebar_top = get_rebar_detail(req_ast_top, "Beam")
                 
+                design_data.append({
+                    "Member ID": f"M{el['id']}", "Type": el['type'], "Floor": el['ni_n']['floor'],
+                    "Size (mm)": el['size'], "Max Pos Mu (kN.m)": round(Mu_pos_max, 1), "Max Neg Mu (kN.m)": round(Mu_neg_max, 1),
+                    "Req Ast Bot": req_ast_bot, "Req Ast Top": req_ast_top, 
+                    "Bot Rebar": rebar_bot, "Top Rebar": rebar_top, "Ties": f"T8 @ {sv_mm} c/c", "Status": stat
+                })
+                
+                # --- BBS GENERATION FOR BEAMS (TOP AND BOTTOM) ---
+                for (count, dia) in parse_rebar_string(rebar_bot):
+                    cut_L = el['L'] - (2 * 0.025) + (50 * dia/1000.0) 
+                    wt = (dia**2 / 162.0) * cut_L * count
+                    bbs_records.append({"Element": f"M{el['id']} (Beam)", "Location": f"Floor {el['ni_n']['floor']}", "Bar Type": "Bottom Span Tension", "Dia (mm)": dia, "No. Bars": count, "Cut Length (m)": round(cut_L, 2), "Total Wt (kg)": round(wt, 2)})
+                
+                for (count, dia) in parse_rebar_string(rebar_top):
+                    cut_L = el['L'] - (2 * 0.025) + (50 * dia/1000.0) 
+                    wt = (dia**2 / 162.0) * cut_L * count
+                    bbs_records.append({"Element": f"M{el['id']} (Beam)", "Location": f"Floor {el['ni_n']['floor']}", "Bar Type": "Top Support Tension", "Dia (mm)": dia, "No. Bars": count, "Cut Length (m)": round(cut_L, 2), "Total Wt (kg)": round(wt, 2)})
+
             else:
+                moment_max = max(Mu_neg_max, Mu_pos_max) # Columns use absolute envelope
                 req_ast, sv_mm, stat = design_column_is456(b_m, h_m, axial, moment_max, shear, torsion_max, fck, fy)
                 rebar_str = get_rebar_detail(req_ast, "Column")
                 
-            design_data.append({
-                "Member ID": f"M{el['id']}", "Type": el['type'], "Floor": el['ni_n']['floor'],
-                "Size (mm)": el['size'], "Max Mu (kN.m)": round(moment_max, 1),
-                "Req Ast (mm²)": req_ast, "Main Rebar": rebar_str, "Tie/Stirrup Spacing": f"T8 @ {sv_mm} c/c", "Status": stat
-            })
-
-            # --- BBS GENERATION: Longitudinal, Hanger & Shear ---
-            parsed_bars = parse_rebar_string(rebar_str)
-            for (count, dia) in parsed_bars:
-                if el['type'] == 'Beam':
-                    cut_L = el['L'] - (2 * 0.025) + (50 * dia/1000.0) 
-                else:
-                    cut_L = el['L'] + (50 * dia/1000.0) 
-                wt = (dia**2 / 162.0) * cut_L * count
-                bbs_records.append({
-                    "Element": f"M{el['id']} ({el['type']})", "Location": f"Floor {el['ni_n']['floor']}",
-                    "Bar Type": "Main Tension/Longitudinal", "Dia (mm)": dia, "No. Bars": count,
-                    "Cut Length (m)": round(cut_L, 2), "Total Wt (kg)": round(wt, 2)
+                design_data.append({
+                    "Member ID": f"M{el['id']}", "Type": el['type'], "Floor": el['ni_n']['floor'],
+                    "Size (mm)": el['size'], "Max Pos Mu (kN.m)": "-", "Max Neg Mu (kN.m)": round(moment_max, 1),
+                    "Req Ast Bot": "-", "Req Ast Top": req_ast, 
+                    "Bot Rebar": "-", "Top Rebar": rebar_str, "Ties": f"T8 @ {sv_mm} c/c", "Status": stat
                 })
                 
-            # ADD TOP HANGER BARS FOR BEAMS (Constructability Requirement)
-            if el['type'] == 'Beam':
-                hanger_dia = 10 if b_m <= 0.25 else 12 
-                hanger_cut_L = el['L'] - (2 * 0.025) + (50 * hanger_dia/1000.0)
-                wt_hanger = (hanger_dia**2 / 162.0) * hanger_cut_L * 2
-                bbs_records.append({
-                    "Element": f"M{el['id']} ({el['type']})", "Location": f"Floor {el['ni_n']['floor']}",
-                    "Bar Type": "Top Anchor/Hanger", "Dia (mm)": hanger_dia, "No. Bars": 2,
-                    "Cut Length (m)": round(hanger_cut_L, 2), "Total Wt (kg)": round(wt_hanger, 2)
-                })
-            
+                # --- BBS GENERATION FOR COLUMNS ---
+                for (count, dia) in parse_rebar_string(rebar_str):
+                    cut_L = el['L'] + (50 * dia/1000.0) 
+                    wt = (dia**2 / 162.0) * cut_L * count
+                    bbs_records.append({"Element": f"M{el['id']} (Column)", "Location": f"Floor {el['ni_n']['floor']}", "Bar Type": "Main Vertical", "Dia (mm)": dia, "No. Bars": count, "Cut Length (m)": round(cut_L, 2), "Total Wt (kg)": round(wt, 2)})
+
+            # Shear Ties (Same for both)
             s_cut = 2*(b_m - 0.05 + h_m - 0.05) + (24 * 0.008) if el['type'] == 'Beam' else 2*(b_m - 0.08 + h_m - 0.08) + (24 * 0.008)
             n_st = int(el['L'] / (sv_mm / 1000.0)) + 1
             wt_st = (8**2 / 162.0) * s_cut * n_st
-            bbs_records.append({
-                "Element": f"M{el['id']} ({el['type']})", "Location": f"Floor {el['ni_n']['floor']}",
-                "Bar Type": f"Shear Tie (8mm @ {sv_mm}c/c)", "Dia (mm)": 8, "No. Bars": n_st,
-                "Cut Length (m)": round(s_cut, 2), "Total Wt (kg)": round(wt_st, 2)
-            })
+            bbs_records.append({"Element": f"M{el['id']} ({el['type']})", "Location": f"Floor {el['ni_n']['floor']}", "Bar Type": f"Shear Tie (8mm @ {sv_mm}c/c)", "Dia (mm)": 8, "No. Bars": n_st, "Cut Length (m)": round(s_cut, 2), "Total Wt (kg)": round(wt_st, 2)})
 
         df_analysis = pd.DataFrame(analysis_data)
         df_design = pd.DataFrame(design_data)
