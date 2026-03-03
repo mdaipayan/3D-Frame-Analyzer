@@ -3,11 +3,12 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import math
+import copy
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer & Designer", layout="wide")
-st.title("🏗️ Practical 3D Frame Analysis & Design Engine")
-st.caption("Yield-Line Theory | Rigid Diaphragms | IS 456 Reinforcement Design ($A_{st}$)")
+st.title("🏗️ 3D Frame Analysis & Complete Building Design")
+st.caption("Includes: Grouped Member Design | Slab Check | Isolated Footing Sizing based on SBC")
 
 # --- INITIALIZE STATE ---
 if 'grids' not in st.session_state:
@@ -64,10 +65,10 @@ elif "1.5 EQ" in combo: f_dl, f_ll, f_eq = 1.5, 0.0, 1.5
 # --- GEOMETRY DATA EDITORS ---
 with st.expander("📐 Modify Building Grids & Geometry", expanded=False):
     col1, col2, col3, col4 = st.columns(4)
-    with col1: st.write("Z-Elevations"); floors_df = st.data_editor(st.session_state.floors, num_rows="dynamic")
-    with col2: st.write("X-Grids"); x_grids_df = st.data_editor(st.session_state.x_grids, num_rows="dynamic")
-    with col3: st.write("Y-Grids"); y_grids_df = st.data_editor(st.session_state.y_grids, num_rows="dynamic")
-    with col4: st.write("Columns"); cols_df = st.data_editor(st.session_state.cols, num_rows="dynamic")
+    with col1: st.write("Z-Elevations"); floors_df = st.data_editor(st.session_state.floors, num_rows="dynamic", width="stretch")
+    with col2: st.write("X-Grids"); x_grids_df = st.data_editor(st.session_state.x_grids, num_rows="dynamic", width="stretch")
+    with col3: st.write("Y-Grids"); y_grids_df = st.data_editor(st.session_state.y_grids, num_rows="dynamic", width="stretch")
+    with col4: st.write("Columns"); cols_df = st.data_editor(st.session_state.cols, num_rows="dynamic", width="stretch")
 
 x_coords_sorted = sorted(list(set([float(r['X_Coord (m)']) for _, r in x_grids_df.iterrows()])))
 y_coords_sorted = sorted(list(set([float(r['Y_Coord (m)']) for _, r in y_grids_df.iterrows()])))
@@ -207,7 +208,7 @@ if show_nodes:
     fig.add_trace(go.Scatter3d(x=[n['x'] for n in phy_nodes], y=[n['y'] for n in phy_nodes], z=[n['z'] for n in phy_nodes], mode='text', text=[f"N{n['id']}" for n in phy_nodes], textfont=dict(color='purple', size=10), textposition="top center", showlegend=False, hoverinfo='none'))
 
 fig.update_layout(scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'), margin=dict(l=0, r=0, b=0, t=0), height=500)
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 # --- ENGINE: MATHS & SOLVER ---
 def calc_yield_line_udl(ni, nj, el_dir, q_area):
@@ -276,7 +277,7 @@ def transform_matrix(ni, nj, angle_deg):
 
 st.divider()
 
-if st.button("🚀 Execute Analysis & Grouped Design", type="primary", use_container_width=True):
+if st.button("🚀 Execute Analysis & Grouped Design", type="primary", width="stretch"):
     with st.spinner("Processing Matrix, Extracting Forces & Sizing Members..."):
         ndof = len(nodes) * 6
         K_global = np.zeros((ndof, ndof))
@@ -347,7 +348,7 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", use_conta
         
         # Post-Processing
         analysis_data, design_data = [], []
-        base_reactions = {} # For footing design
+        base_reactions = {}
 
         for el in elements:
             if el['type'] == 'Diaphragm': continue
@@ -367,18 +368,15 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", use_conta
                 if 0 < x_max < el['L']:
                     moment_max = max(moment_max, abs(f_int[5] + (Vy_i * x_max) - (0.5 * w * x_max**2)))
 
-            # Save Base Reactions for Footing
             if el['type'] == 'Column' and el['ni_n']['z'] == 0:
                 base_reactions[el['ni_n']['id']] = {'Pu': abs(f_int[0]), 'Col_Size': el['size']}
 
-            # Analysis Row
             analysis_data.append({
                 "Member ID": f"M{el['id']}", "Type": el['type'], "Floor": el['ni_n']['floor'],
                 "Length (m)": round(el['L'], 2), "Axial (kN)": round(axial, 1), 
                 "Shear (kN)": round(shear, 1), "Moment (kN.m)": round(moment_max, 1)
             })
 
-            # Design Row
             b_m, h_m = map(lambda x: float(x)/1000.0, el['size'].split('x'))
             if el['type'] == 'Beam':
                 req_ast, stat = design_beam_is456(b_m, h_m, moment_max, shear, fck, fy)
@@ -399,7 +397,7 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", use_conta
         
         with tab1:
             st.markdown("### Individual Member Internal Forces")
-            st.dataframe(df_analysis)
+            st.dataframe(df_analysis, width="stretch")
             
         with tab2:
             st.markdown("### IS 456 Grouped Design Envelopes")
@@ -411,7 +409,7 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", use_conta
                     Max_Pu=('Max Pu (kN)', 'max'), Max_Mu=('Max Mu (kN.m)', 'max'), Max_Ast=('Req Steel (mm²)', 'max')
                 ).reset_index()
                 st.subheader("Column Groups")
-                st.dataframe(col_group)
+                st.dataframe(col_group, width="stretch")
                 
             df_beam = df_design[df_design['Type'] == 'Beam']
             if not df_beam.empty:
@@ -419,10 +417,9 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", use_conta
                     Max_Mu=('Max Mu (kN.m)', 'max'), Max_Ast=('Req Steel (mm²)', 'max')
                 ).reset_index()
                 st.subheader("Beam Groups")
-                st.dataframe(beam_group)
+                st.dataframe(beam_group, width="stretch")
                 
         with tab3:
-            # SLAB DESIGN
             st.markdown("### IS 456 Two-Way Slab Check (Critical Panel)")
             x_spans = [x_coords_sorted[i+1] - x_coords_sorted[i] for i in range(len(x_coords_sorted)-1) if (x_coords_sorted[i+1] - x_coords_sorted[i]) > 0.1]
             y_spans = [y_coords_sorted[i+1] - y_coords_sorted[i] for i in range(len(y_coords_sorted)-1) if (y_coords_sorted[i+1] - y_coords_sorted[i]) > 0.1]
@@ -445,7 +442,6 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", use_conta
             if safe_slab: st.success("✅ Slab Thickness is Safe")
             else: st.error("❌ Slab Thickness Fails Deflection/Flexure. Increase Thickness.")
             
-            # FOOTING DESIGN
             st.markdown("### Isolated Pad Footings (Based on SBC)")
             st.info(f"Using Unfactored Service Loads (Pu / 1.5) + 10% Self-Weight against SBC = {sbc} kN/m²")
             
@@ -457,7 +453,7 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", use_conta
                 
                 net_upward_p = data['Pu'] / (Side_L**2)
                 col_c = max(map(float, data['Col_Size'].split('x'))) / 1000.0
-                proj_x = (Side_L - col_c) / 2.0
+                proj_x = max((Side_L - col_c) / 2.0, 0.01)
                 Mu_footing = net_upward_p * Side_L * (proj_x**2) / 2.0
                 d_req_footing = math.sqrt((Mu_footing * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * (Side_L*1000)))
                 D_prov = max(300, math.ceil((d_req_footing + 50) / 50.0) * 50)
@@ -470,4 +466,4 @@ if st.button("🚀 Execute Analysis & Grouped Design", type="primary", use_conta
                     "Min Depth (mm)": int(D_prov)
                 })
                 
-            st.dataframe(pd.DataFrame(footing_results))
+            st.dataframe(pd.DataFrame(footing_results), width="stretch")
