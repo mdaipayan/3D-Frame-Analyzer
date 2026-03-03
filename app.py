@@ -158,34 +158,35 @@ def calculate_shear_spacing(Ve_kN, b, d, fck, fy, is_column=False):
     sv_final = max(min(math.floor(sv / 10) * 10, sv_max), 100) 
     return int(sv_final), "Safe"
 
-def design_beam_is456(b_m, h_m, Mu_kNm, Vu_kN, Tu_kNm, fck, fy):
+def design_beam_is456(b_m, h_m, Mu_pos_kNm, Mu_neg_kNm, Vu_kN, Tu_kNm, fck, fy):
     b, h = max(b_m * 1000, 1.0), max(h_m * 1000, 1.0)
     d = max(h - 40, 1.0) 
     
-    # 1. IS 456 Equivalent Torsion Formulas
+    # Equivalent Torsion Formulas
     Ve_kN = Vu_kN + 1.6 * (Tu_kNm / b_m) if b_m > 0 else Vu_kN
     Mt_kNm = Tu_kNm * (1 + (h_m / b_m)) / 1.7 if b_m > 0 else 0
-    Me_kNm = Mu_kNm + Mt_kNm # Equivalent Bending Moment
     
-    Me = Me_kNm * 1e6 
-    Mu_lim = (0.133 if fy >= 500 else 0.138) * fck * b * d**2
+    # Equivalent Moments for Top (Neg) and Bottom (Pos)
+    Me_pos = Mu_pos_kNm + Mt_kNm
+    Me_neg = Mu_neg_kNm + Mt_kNm 
     
-    status = "Singly Reinf."
-    if Me <= Mu_lim:
-        Ast_req = (0.5 * fck / fy) * (1 - math.sqrt(max(1 - (4.6 * Me) / max(fck * b * d**2, 1.0), 0))) * b * d
-    else:
-        Ast1 = (0.5 * fck / fy) * (1 - math.sqrt(max(1 - (4.6 * Mu_lim) / max(fck * b * d**2, 1.0), 0))) * b * d
-        Ast_req = Ast1 + ((Me - Mu_lim) / max(0.87 * fy * d, 1.0))
-        status = "Doubly Reinf."
-        
-    Ast_req = max(Ast_req, 0.85 * b * d / max(fy, 1.0))
+    def calc_ast(Me_kNm):
+        Me = Me_kNm * 1e6
+        Mu_lim = (0.133 if fy >= 500 else 0.138) * fck * b * d**2
+        if Me <= Mu_lim:
+            ast = (0.5 * fck / fy) * (1 - math.sqrt(max(1 - (4.6 * Me) / max(fck * b * d**2, 1.0), 0))) * b * d
+        else:
+            ast1 = (0.5 * fck / fy) * (1 - math.sqrt(max(1 - (4.6 * Mu_lim) / max(fck * b * d**2, 1.0), 0))) * b * d
+            ast = ast1 + ((Me - Mu_lim) / max(0.87 * fy * d, 1.0))
+        return max(ast, 0.85 * b * d / max(fy, 1.0)) # Code Minimum Enforcement
+
+    Ast_bot = calc_ast(Me_pos)
+    Ast_top = calc_ast(Me_neg)
+    
     sv, shear_stat = calculate_shear_spacing(Ve_kN, b, d, fck, fy)
-    
-    # IS 456 mandates closed stirrups for torsion. Tagging for BBS.
     if Tu_kNm > 1.0: shear_stat += " (Closed Torsion Ties)"
-    if "Fail" in shear_stat: status += " | Shear/Torsion Fail"
     
-    return round(Ast_req, 1), sv, status
+    return round(Ast_bot, 1), round(Ast_top, 1), sv, shear_stat
 
 def design_column_is456(b_m, h_m, Pu_kN, Mu_kNm, Vu_kN, Tu_kNm, fck, fy):
     b, h = max(b_m * 1000, 1.0), max(h_m * 1000, 1.0)
