@@ -7,8 +7,8 @@ import copy
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer", layout="wide")
-st.title("🏗️ Advanced 3D Frame Validation Engine")
-st.caption("Rigid Diaphragms | True Seismic Mass Integration | Column 3D Tensors")
+st.title("🏗️ Practical 3D Frame Analysis Engine")
+st.caption("Yield-Line Theory | Rigid Diaphragm Shear Distribution | Cracked Section Modifiers")
 
 # --- INITIALIZE STATE ---
 if 'grids' not in st.session_state:
@@ -31,7 +31,7 @@ E_conc = 5000 * math.sqrt(fck) * 1000  # kN/m^2
 G_conc = E_conc / (2 * (1 + 0.2))
 
 st.sidebar.header("2. Section Sizes (mm)")
-col_size = st.sidebar.text_input("Column (b x h)", "230x450")
+col_size = st.sidebar.text_input("Column (b x h)", "300x450")
 beam_size = st.sidebar.text_input("Beam (b x h)", "230x400")
 
 st.sidebar.header("3. Applied Loads (IS 875)")
@@ -60,10 +60,11 @@ elif "1.5 EQ" in combo: f_dl, f_ll, f_eq = 1.5, 0.0, 1.5
 # --- GEOMETRY DATA EDITORS ---
 with st.expander("📐 Modify Building Grids & Geometry", expanded=False):
     col1, col2, col3, col4 = st.columns(4)
-    with col1: st.write("Z-Elevations"); floors_df = st.data_editor(st.session_state.floors, num_rows="dynamic", use_container_width=True)
-    with col2: st.write("X-Grids"); x_grids_df = st.data_editor(st.session_state.x_grids, num_rows="dynamic", use_container_width=True)
-    with col3: st.write("Y-Grids"); y_grids_df = st.data_editor(st.session_state.y_grids, num_rows="dynamic", use_container_width=True)
-    with col4: st.write("Columns"); cols_df = st.data_editor(st.session_state.cols, num_rows="dynamic", use_container_width=True)
+    # Replaced use_container_width with width="stretch"
+    with col1: st.write("Z-Elevations"); floors_df = st.data_editor(st.session_state.floors, num_rows="dynamic", width="stretch")
+    with col2: st.write("X-Grids"); x_grids_df = st.data_editor(st.session_state.x_grids, num_rows="dynamic", width="stretch")
+    with col3: st.write("Y-Grids"); y_grids_df = st.data_editor(st.session_state.y_grids, num_rows="dynamic", width="stretch")
+    with col4: st.write("Columns"); cols_df = st.data_editor(st.session_state.cols, num_rows="dynamic", width="stretch")
 
 x_coords_sorted = sorted(list(set([float(r['X_Coord (m)']) for _, r in x_grids_df.iterrows()])))
 y_coords_sorted = sorted(list(set([float(r['Y_Coord (m)']) for _, r in y_grids_df.iterrows()])))
@@ -90,14 +91,12 @@ def build_mesh():
             primary_xy.append({'x': px, 'y': py, 'angle': ang})
             
     nid = 0
-    # Generate Physical Nodes
     for f in range(len(floors_df) + 1):
         for pt in primary_xy:
             nodes.append({'id': nid, 'x': pt['x'], 'y': pt['y'], 'z': z_elevs.get(f, 0.0), 'floor': f, 'angle': pt['angle'], 'is_dummy': False})
             nid += 1
             
     eid = 0
-    # Generate Columns
     for z in range(len(floors_df)):
         b_nodes = [n for n in nodes if n['floor'] == z and not n['is_dummy']]
         t_nodes = [n for n in nodes if n['floor'] == z + 1 and not n['is_dummy']]
@@ -107,7 +106,6 @@ def build_mesh():
                 elements.append({'id': eid, 'ni': bn['id'], 'nj': tn['id'], 'type': 'Column', 'size': col_size, 'dir': 'Z', 'angle': bn['angle']})
                 eid += 1
                 
-    # Generate Beams (Tolerance 0.1m)
     for z in range(1, len(floors_df) + 1):
         f_nodes = [n for n in nodes if n['floor'] == z and not n['is_dummy']]
         
@@ -135,7 +133,6 @@ def build_mesh():
                 elements.append({'id': eid, 'ni': grp[i]['id'], 'nj': grp[i+1]['id'], 'type': 'Beam', 'size': beam_size, 'dir': 'Y', 'angle': 0.0})
                 eid += 1
                 
-    # Generate Rigid Diaphragm Master Nodes & Struts
     diaphragm_nodes = {}
     for z in range(1, len(floors_df) + 1):
         f_nodes = [n for n in nodes if n['floor'] == z and not n['is_dummy']]
@@ -166,7 +163,7 @@ for el in elements:
     fig.add_trace(go.Scatter3d(x=[ni['x'], nj['x']], y=[ni['y'], nj['y']], z=[ni['z'], nj['z']], mode='lines', line=dict(color=color, width=5), hoverinfo='text', text=f"ID: {el['id']} ({el['type']})", showlegend=False))
 fig.add_trace(go.Scatter3d(x=[n['x'] for n in nodes if not n['is_dummy']], y=[n['y'] for n in nodes if not n['is_dummy']], z=[n['z'] for n in nodes if not n['is_dummy']], mode='markers', marker=dict(size=3, color='black'), hoverinfo='none', showlegend=False))
 fig.update_layout(scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'), margin=dict(l=0, r=0, b=0, t=0), height=450)
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 # --- ENGINE: MATHS & SOLVER ---
 def calc_yield_line_udl(ni, nj, el_dir, q_area):
@@ -193,10 +190,12 @@ def calc_yield_line_udl(ni, nj, el_dir, q_area):
 
 def get_props(size_str, el_type):
     if el_type == 'Diaphragm':
-        return 100.0, 1e-6, 1e-6, 1e-6 # Infinite Area, Zero Bending Stiffness
+        return 100.0, 1e-6, 1e-6, 1e-6 
         
     b, h = map(float, size_str.split('x'))
-    b, h = b/1000.0, h/1000.0
+    # SAFEGUARD: Prevent ZeroDivision if user enters "0x0"
+    b, h = max(b/1000.0, 0.001), max(h/1000.0, 0.001)
+    
     A = b * h
     Iy, Iz = (h * b**3) / 12.0, (b * h**3) / 12.0
     dim_min, dim_max = min(b, h), max(b, h)
@@ -209,6 +208,8 @@ def get_props(size_str, el_type):
     return A, Iy, Iz, J
 
 def local_k(A, Iy, Iz, J, L):
+    # SAFEGUARD: Prevent ZeroDivision if elements have 0.0 length
+    L = max(L, 0.001)
     k = np.zeros((12, 12))
     k[0,0]=k[6,6]= E_conc*A/L; k[0,6]=k[6,0]= -E_conc*A/L
     k[3,3]=k[9,9]= G_conc*J/L; k[3,9]=k[9,3]= -G_conc*J/L
@@ -232,7 +233,6 @@ def transform_matrix(ni, nj, angle_deg):
         D = math.sqrt(cx**2 + cy**2)
         lam = np.array([[cx, cy, cz], [-cx*cz/D, -cy*cz/D, D], [-cy/D, cx/D, 0]])
         
-    # True 3D Roll Transformation for Columns
     if angle_deg != 0.0:
         rad = math.radians(angle_deg)
         c, s = math.cos(rad), math.sin(rad)
@@ -245,7 +245,7 @@ def transform_matrix(ni, nj, angle_deg):
 
 st.divider()
 
-if st.button("🚀 Execute Validation Matrix", type="primary", use_container_width=True):
+if st.button("🚀 Execute Validation Matrix", type="primary", width="stretch"):
     with st.spinner("Applying Kinematic Constraints & Synthesizing Local Gradients..."):
         ndof = len(nodes) * 6
         K_global = np.zeros((ndof, ndof))
@@ -317,9 +317,8 @@ if st.button("🚀 Execute Validation Matrix", type="primary", use_container_wid
             for z in range(1, len(floors_df)+1):
                 if sum_wh2 > 0 and z in diaphragm_nodes:
                     floor_f = Vb * (floor_seismic_W[z] * (z_elevs[z]**2)) / sum_wh2
-                    # Apply purely to Master Node. The web distributes it, naturally inducing Torsion!
                     d_id = diaphragm_nodes[z]['id']
-                    F_global[d_id * 6] += floor_f  # Push in X direction
+                    F_global[d_id * 6] += floor_f  
 
         # LEAST SQUARES SOLVER
         fixed = [n['id']*6 + d for n in nodes if n['z'] == 0 for d in range(6)]
@@ -356,7 +355,6 @@ if st.button("🚀 Execute Validation Matrix", type="primary", use_container_wid
                 Vy_i = f_int[1] 
                 x_max = Vy_i / w if w > 0 else -1
                 
-                # Precise Boundary Value Superposition
                 if 0 < x_max < el['L']:
                     M_span = Mz_i + (Vy_i * x_max) - (0.5 * w * x_max**2)
                     moment_max = max(moment_max, abs(M_span))
@@ -374,9 +372,9 @@ if st.button("🚀 Execute Validation Matrix", type="primary", use_container_wid
         colA, colB = st.columns(2)
         with colA:
             st.subheader("Column Forces")
-            st.dataframe(df_res[df_res['Type'] == 'Column'].reset_index(drop=True), use_container_width=True)
+            st.dataframe(df_res[df_res['Type'] == 'Column'].reset_index(drop=True), width="stretch")
         with colB:
             st.subheader("Beam Forces")
-            st.dataframe(df_res[df_res['Type'] == 'Beam'].reset_index(drop=True), use_container_width=True)
+            st.dataframe(df_res[df_res['Type'] == 'Beam'].reset_index(drop=True), width="stretch")
             
-        st.download_button(label="⬇️ Download Full Results (CSV)", data=df_res.to_csv(index=False), file_name=f"frame_results_{combo}.csv", mime="text/csv", use_container_width=True)
+        st.download_button(label="⬇️ Download Full Results (CSV)", data=df_res.to_csv(index=False), file_name=f"frame_results_{combo}.csv", mime="text/csv", width="stretch")
