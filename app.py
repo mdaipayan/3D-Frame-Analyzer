@@ -10,7 +10,7 @@ import base64
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer & Designer", layout="wide")
 st.title("🏗️ 3D Frame Analysis & Complete Building Design")
-st.caption("Audited: Dynamic Shear | BBS | Professional PDF Export")
+st.caption("Audited: 3D Viewport | PDF Export | Dynamic Shear | Mixed Rebar | BBS")
 
 # --- INITIALIZE STATE ---
 if 'grids' not in st.session_state:
@@ -29,10 +29,15 @@ if 'grids' not in st.session_state:
 # --- SIDEBAR: CSV IMPORT / EXPORT ---
 st.sidebar.header("📂 CSV Import / Export")
 csv_choice = st.sidebar.selectbox("Select Table to Modify:", ["Floors", "X-Grids", "Y-Grids", "Columns"])
+
 mapping = {"Floors": "floors", "X-Grids": "x_grids", "Y-Grids": "y_grids", "Columns": "cols"}
 active_key = mapping[csv_choice]
+
 csv_data = st.session_state[active_key].to_csv(index=False).encode('utf-8')
-st.sidebar.download_button(label=f"⬇️ Download {csv_choice} (CSV)", data=csv_data, file_name=f"{active_key}_template.csv", mime="text/csv", width="stretch")
+st.sidebar.download_button(
+    label=f"⬇️ Download {csv_choice} (CSV)",
+    data=csv_data, file_name=f"{active_key}_template.csv", mime="text/csv", width="stretch"
+)
 
 uploaded_csv = st.sidebar.file_uploader(f"⬆️ Upload {csv_choice} (CSV)", type=["csv"])
 if uploaded_csv is not None:
@@ -44,6 +49,7 @@ if uploaded_csv is not None:
             st.rerun()
         except Exception as e:
             st.sidebar.error(f"Error reading CSV: {e}")
+
 st.sidebar.divider()
 
 # --- SIDEBAR: INPUTS ---
@@ -69,6 +75,8 @@ sbc = st.sidebar.number_input("Safe Bearing Capacity (kN/m²)", value=150.0, ste
 
 st.sidebar.header("5. Engine Settings")
 apply_cracked_modifiers = st.sidebar.checkbox("Use IS 1893 Cracked Sections", value=True)
+show_nodes = st.sidebar.checkbox("Show Node Numbers in 3D", value=False)
+show_members = st.sidebar.checkbox("Show Member IDs in 3D", value=False)
 
 st.sidebar.header("6. IS Code Combinations")
 combo = st.sidebar.selectbox("Select Load Combination", ["1.5 DL + 1.5 LL", "1.2 DL + 1.2 LL + 1.2 EQ", "1.5 DL + 1.5 EQ", "0.9 DL + 1.5 EQ"])
@@ -102,7 +110,6 @@ class PDFReport(FPDF):
         self.cell(0, 6, 'Designed as per IS 456:2000 & IS 1893', border=1, ln=1, align='C')
         self.ln(2)
         self.set_font('Arial', 'B', 11)
-        # --- THE ENGINEER TITLE BLOCK ---
         self.cell(0, 8, 'Structural Engineer: Mr. D. Mandal, M.Tech. Structures', ln=1, align='R')
         self.line(10, self.get_y(), 200, self.get_y())
         self.ln(5)
@@ -275,6 +282,26 @@ def build_mesh():
     return nodes, elements, diaphragm_nodes
 
 nodes, elements, diaphragm_nodes = build_mesh()
+
+# --- THE RESTORED 3D VIEWPORT ---
+st.subheader("🖥️ 3D Architectural Viewport")
+fig = go.Figure()
+for el in elements:
+    if el['type'] == 'Diaphragm': continue
+    ni, nj = next(n for n in nodes if n['id'] == el['ni']), next(n for n in nodes if n['id'] == el['nj'])
+    color = '#1f77b4' if el['type'] == 'Column' else '#d62728'
+    fig.add_trace(go.Scatter3d(x=[ni['x'], nj['x']], y=[ni['y'], nj['y']], z=[ni['z'], nj['z']], mode='lines', line=dict(color=color, width=4), hoverinfo='text', text=f"ID: {el['id']}", showlegend=False))
+    if show_members: fig.add_trace(go.Scatter3d(x=[(ni['x']+nj['x'])/2], y=[(ni['y']+nj['y'])/2], z=[(ni['z']+nj['z'])/2], mode='text', text=[f"M{el['id']}"], textfont=dict(color='green', size=10), showlegend=False, hoverinfo='none'))
+
+phy_nodes = [n for n in nodes if not n['is_dummy']]
+fig.add_trace(go.Scatter3d(x=[n['x'] for n in phy_nodes], y=[n['y'] for n in phy_nodes], z=[n['z'] for n in phy_nodes], mode='markers', marker=dict(size=3, color='black'), hoverinfo='none', showlegend=False))
+
+if show_nodes:
+    fig.add_trace(go.Scatter3d(x=[n['x'] for n in phy_nodes], y=[n['y'] for n in phy_nodes], z=[n['z'] for n in phy_nodes], mode='text', text=[f"N{n['id']}" for n in phy_nodes], textfont=dict(color='purple', size=10), textposition="top center", showlegend=False, hoverinfo='none'))
+
+fig.update_layout(scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'), margin=dict(l=0, r=0, b=0, t=0), height=500)
+st.plotly_chart(fig, width="stretch")
+# ---------------------------------
 
 def calc_yield_line_udl(ni, nj, el_dir, q_area):
     L_beam = math.sqrt((nj['x']-ni['x'])**2 + (nj['y']-ni['y'])**2)
