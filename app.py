@@ -129,7 +129,7 @@ def build_mesh():
         if xg in x_map and yg in y_map:
             primary_xy.append({'x': x_map[xg] + float(r.get('X_Offset (m)', 0.0)), 'y': y_map[yg] + float(r.get('Y_Offset (m)', 0.0)), 'angle': float(r.get('Angle (deg)', 0.0))})
             
-    nid, eid = 1, 1 
+    nid, eid = 0, 1 # CRITICAL FIX: Matrix indexing requires nodes to start at 0
     for f in range(len(floors_df) + 1):
         for pt in primary_xy:
             nodes.append({'id': nid, 'x': pt['x'], 'y': pt['y'], 'z': z_elevs.get(f, 0.0), 'floor': f, 'angle': pt['angle'], 'is_dummy': False})
