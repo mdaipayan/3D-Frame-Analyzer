@@ -8,6 +8,7 @@ import os
 import tempfile
 from fpdf import FPDF
 import ezdxf
+from ezdxf.enums import TextEntityAlignment
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer & Designer", layout="wide")
@@ -357,7 +358,7 @@ def transform_matrix(ni, nj, angle_deg):
 
 st.divider()
 
-if st.button("🚀 Execute Complete Analysis & Generate CAD / PDF", type="primary", width="stretch"):
+if st.button("🚀 Execute Analysis & Generate CAD / PDF", type="primary", width="stretch"):
     with st.spinner("Solving Matrix, Running Code Checks & Building CAD Files..."):
         ndof = len(nodes) * 6
         K_global = np.zeros((ndof, ndof))
@@ -541,20 +542,35 @@ if st.button("🚀 Execute Complete Analysis & Generate CAD / PDF", type="primar
         pdf.cell(0, 10, f'TOTAL STEEL TONNAGE REQUIRED: {total_wt_kg / 1000.0:.2f} Metric Tons', 0, 1, 'R')
         pdf_bytes = pdf.output(dest='S').encode('latin-1')
 
-        # --- GENERATE DXF (LibreCAD/AutoCAD WITH REBAR DETAILS) ---
+        # --- GENERATE DXF (LibreCAD/AutoCAD WITH DETAILED SP-34 REBAR) ---
         doc = ezdxf.new('R2010')
         msp = doc.modelspace()
-        doc.layers.add('GRIDS', color=8)
+        doc.layers.add('GRIDS', color=8, linetype='DASHED')
         doc.layers.add('CONCRETE_OUTLINE', color=2)
         doc.layers.add('REBAR_MAIN', color=1)
         doc.layers.add('REBAR_TIES', color=3)
+        doc.layers.add('DIMENSIONS', color=6)
         doc.layers.add('ANNOTATIONS', color=7)
-        
+
+        def add_dim(p1, p2, offset, text, is_vert=False):
+            if not is_vert:
+                msp.add_line((p1[0], p1[1]), (p1[0], p1[1]+offset), dxfattribs={'layer': 'DIMENSIONS'})
+                msp.add_line((p2[0], p2[1]), (p2[0], p2[1]+offset), dxfattribs={'layer': 'DIMENSIONS'})
+                dy = p1[1]+offset - (0.2 if offset>0 else -0.2)
+                msp.add_line((p1[0], dy), (p2[0], dy), dxfattribs={'layer': 'DIMENSIONS'})
+                msp.add_text(text, dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement(((p1[0]+p2[0])/2 - len(text)*0.04, dy+0.05))
+            else:
+                msp.add_line((p1[0], p1[1]), (p1[0]+offset, p1[1]), dxfattribs={'layer': 'DIMENSIONS'})
+                msp.add_line((p2[0], p2[1]), (p2[0]+offset, p2[1]), dxfattribs={'layer': 'DIMENSIONS'})
+                dx = p1[0]+offset - (0.2 if offset>0 else -0.2)
+                msp.add_line((dx, p1[1]), (dx, p2[1]), dxfattribs={'layer': 'DIMENSIONS'})
+                msp.add_text(text, dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((dx+0.05, (p1[1]+p2[1])/2 - 0.06))
+
         max_x = max(x_coords_sorted) if x_coords_sorted else 10
         max_y = max(y_coords_sorted) if y_coords_sorted else 10
         offset_x = max_x + 5.0 
         
-        # 1. Draw Floor Framing Plans
+        # 1. Floor Framing Plans
         for idx, row in floors_df.iterrows():
             f_num = int(row['Floor'])
             bx = idx * offset_x 
@@ -575,7 +591,6 @@ if st.button("🚀 Execute Complete Analysis & Generate CAD / PDF", type="primar
             for col in f_cols:
                 cx, cy = bx + col['nj_n']['x'], col['nj_n']['y']
                 msp.add_lwpolyline([(cx - col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy - col_h_m/2)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-                msp.add_text(f"C", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx + col_b_m/2 + 0.1, cy + col_h_m/2 + 0.1))
                 
             beam_b_m, beam_h_m = map(lambda val: float(val)/1000.0, beam_size.split('x'))
             f_beams = [el for el in elements if el['type'] == 'Beam' and el['ni_n']['floor'] == f_num]
@@ -588,85 +603,133 @@ if st.button("🚀 Execute Complete Analysis & Generate CAD / PDF", type="primar
                 else: 
                     msp.add_line((nx1 + beam_b_m/2, ny1), (nx2 + beam_b_m/2, ny2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
                     msp.add_line((nx1 - beam_b_m/2, ny1), (nx2 - beam_b_m/2, ny2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-                msp.add_text(f"B", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement(((nx1+nx2)/2 + 0.1, (ny1+ny2)/2 + 0.1))
 
-        # 2. Draw Typical Reinforcement Details Section
+        # 2. Detailed Reinforcement Sections
         det_x = len(floors_df) * offset_x + 2.0
-        msp.add_text("TYPICAL REINFORCEMENT SECTIONS (IS 456)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.6}).set_placement((det_x, max_y + 2.0))
+        msp.add_text("TYPICAL DETAILED REINFORCEMENT SECTIONS (IS 456 / SP 34)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.5}).set_placement((det_x, max_y + 2.0))
         
-        # 2A. Column Detail (Pulling max designed column)
+        # 2A. Column Details (L-Sec and C/S)
         col_list = [d for d in design_data if d['Type'] == 'Column']
         if col_list:
-            c_det = col_list[0] # Grab highest floor typical column
+            c_det = col_list[0] 
             cb, ch = map(lambda x: float(x)/1000.0, c_det['Size'].split('x'))
-            cx, cy = det_x + 2.0, max_y - 1.0
-            msp.add_lwpolyline([(cx,cy), (cx+cb,cy), (cx+cb,cy+ch), (cx,cy+ch), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            msp.add_lwpolyline([(cx+0.04,cy+0.04), (cx+cb-0.04,cy+0.04), (cx+cb-0.04,cy+ch-0.04), (cx+0.04,cy+ch-0.04), (cx+0.04,cy+0.04)], dxfattribs={'layer': 'REBAR_TIES'})
+            cx, cy = det_x, max_y - 1.0
             
-            bars = parse_rebar_string(c_det['Top Rebar'])
-            total_bars = sum([b[0] for b in bars]) if bars else 4
-            # Draw 4 corner bars
-            r = 0.015
-            for px, py in [(cx+0.05,cy+0.05), (cx+cb-0.05,cy+0.05), (cx+cb-0.05,cy+ch-0.05), (cx+0.05,cy+ch-0.05)]:
-                msp.add_circle((px, py), radius=r, dxfattribs={'layer': 'REBAR_MAIN'})
-            # Add side bars if > 4
-            if total_bars > 4:
-                msp.add_circle((cx+cb/2, cy+0.05), radius=r, dxfattribs={'layer': 'REBAR_MAIN'})
-                msp.add_circle((cx+cb/2, cy+ch-0.05), radius=r, dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_text(f"TYPICAL COLUMN: {c_det['Size']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.5))
-            msp.add_text(f"Main: {c_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
-            msp.add_text(f"Ties: {c_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.0))
+            # Column L-Sec
+            msp.add_lwpolyline([(cx, cy), (cx+cb, cy), (cx+cb, cy-3.0), (cx, cy-3.0), (cx, cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_line((cx-0.3, cy), (cx+cb+0.3, cy), dxfattribs={'layer': 'GRIDS'}) 
+            msp.add_line((cx-0.3, cy-3.0), (cx+cb+0.3, cy-3.0), dxfattribs={'layer': 'GRIDS'}) 
+            msp.add_line((cx+0.04, cy+0.5), (cx+0.04, cy-3.0-0.5), dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_line((cx+cb-0.04, cy+0.5), (cx+cb-0.04, cy-3.0-0.5), dxfattribs={'layer': 'REBAR_MAIN'})
+            # Splice
+            msp.add_line((cx+0.06, cy-3.0), (cx+0.06, cy-3.0+0.6), dxfattribs={'layer': 'REBAR_MAIN'})
+            sv_m = float(c_det['Ties'].split('@')[1].replace('c/c','').strip()) / 1000.0
+            for i in range(int(3.0/sv_m)): msp.add_line((cx+0.04, cy-3.0+(i*sv_m)), (cx+cb-0.04, cy-3.0+(i*sv_m)), dxfattribs={'layer': 'REBAR_TIES'})
+            add_dim((cx-0.3, cy-3.0), (cx-0.3, cy), -0.5, "Floor Ht 3.0m", True)
+            add_dim((cx, cy+0.2), (cx+cb, cy+0.2), 0.4, f"w={int(cb*1000)}")
+            msp.add_text("COLUMN L-SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 3.8))
+            
+            # Column C/S
+            cs_x = cx + cb + 1.5
+            msp.add_lwpolyline([(cs_x,cy-1.0), (cs_x+cb,cy-1.0), (cs_x+cb,cy-1.0-ch), (cs_x,cy-1.0-ch), (cs_x,cy-1.0)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_lwpolyline([(cs_x+0.04,cy-1.0-0.04), (cs_x+cb-0.04,cy-1.0-0.04), (cs_x+cb-0.04,cy-1.0-ch+0.04), (cs_x+0.04,cy-1.0-ch+0.04), (cs_x+0.04,cy-1.0-0.04)], dxfattribs={'layer': 'REBAR_TIES'})
+            for px, py in [(cs_x+0.05,cy-1.0-0.05), (cs_x+cb-0.05,cy-1.0-0.05), (cs_x+cb-0.05,cy-1.0-ch+0.05), (cs_x+0.05,cy-1.0-ch+0.05)]:
+                msp.add_circle((px, py), radius=0.015, dxfattribs={'layer': 'REBAR_MAIN'})
+            add_dim((cs_x, cy-1.0+0.1), (cs_x+cb, cy-1.0+0.1), 0.3, f"{int(cb*1000)}")
+            add_dim((cs_x+cb+0.1, cy-1.0-ch), (cs_x+cb+0.1, cy-1.0), 0.3, f"{int(ch*1000)}", True)
+            msp.add_text("COLUMN C/S", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cs_x, cy - 1.0 - ch - 0.4))
+            msp.add_text(f"Main: {c_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cs_x, cy - 1.0 - ch - 0.7))
+            msp.add_text(f"Ties: {c_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cs_x, cy - 1.0 - ch - 0.9))
 
-        # 2B. Beam Detail
+        # 2B. Beam Details (L-Sec and C/S)
         bm_list = [d for d in design_data if d['Type'] == 'Beam']
         if bm_list:
             b_det = bm_list[0]
             bb, bh = map(lambda x: float(x)/1000.0, b_det['Size'].split('x'))
-            cx, cy = det_x + 6.0, max_y - 1.0
-            msp.add_lwpolyline([(cx,cy), (cx+bb,cy), (cx+bb,cy+bh), (cx,cy+bh), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            msp.add_lwpolyline([(cx+0.025,cy+0.025), (cx+bb-0.025,cy+0.025), (cx+bb-0.025,cy+bh-0.025), (cx+0.025,cy+bh-0.025), (cx+0.025,cy+0.025)], dxfattribs={'layer': 'REBAR_TIES'})
-            # 2 Top Hangers
-            msp.add_circle((cx+0.04, cy+bh-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_circle((cx+bb-0.04, cy+bh-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
-            # Bottom Main Bars
-            bot_bars = parse_rebar_string(b_det['Bot Rebar'])
-            n_bot = bot_bars[0][0] if bot_bars else 3
-            for i in range(n_bot):
-                px = cx + 0.04 + (i * ((bb - 0.08) / max(n_bot-1, 1)))
-                msp.add_circle((px, cy+0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_text(f"TYPICAL BEAM: {b_det['Size']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.5))
-            msp.add_text(f"Bot Main: {b_det['Bot Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
-            msp.add_text(f"Top Extra: {b_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.0))
-            msp.add_text(f"Stirrups: {b_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.2))
+            cx, cy = det_x + 4.5, max_y - 1.0
+            
+            # Beam L-Sec
+            span = 4.0
+            msp.add_lwpolyline([(cx, cy), (cx+span, cy), (cx+span, cy-bh), (cx, cy-bh), (cx, cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_line((cx, cy+0.2), (cx, cy-bh-0.5), dxfattribs={'layer': 'GRIDS'}) # Supp 1
+            msp.add_line((cx+span, cy+0.2), (cx+span, cy-bh-0.5), dxfattribs={'layer': 'GRIDS'}) # Supp 2
+            
+            # Bot main
+            msp.add_line((cx+0.05, cy-bh+0.03), (cx+span-0.05, cy-bh+0.03), dxfattribs={'layer': 'REBAR_MAIN'})
+            # Top extra (0.3L)
+            msp.add_line((cx+0.05, cy-0.03), (cx+0.3*span, cy-0.03), dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_line((cx+span-0.3*span, cy-0.03), (cx+span-0.05, cy-0.03), dxfattribs={'layer': 'REBAR_MAIN'})
+            # Hanger
+            msp.add_line((cx+0.3*span, cy-0.03), (cx+span-0.3*span, cy-0.03), dxfattribs={'layer': 'REBAR_TIES'})
+            
+            sv_m = float(b_det['Ties'].split('@')[1].replace('c/c','').strip()) / 1000.0
+            for i in range(int(span/sv_m)): msp.add_line((cx+(i*sv_m), cy-0.03), (cx+(i*sv_m), cy-bh+0.03), dxfattribs={'layer': 'REBAR_TIES'})
+            
+            add_dim((cx, cy+0.1), (cx+span, cy+0.1), 0.4, f"Clear Span L")
+            msp.add_text("BEAM L-SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx+span/2 - 0.8, cy - bh - 0.6))
+            
+            # Beam C/S
+            cs_x = cx + span + 1.0
+            msp.add_lwpolyline([(cs_x,cy), (cs_x+bb,cy), (cs_x+bb,cy-bh), (cs_x,cy-bh), (cs_x,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_lwpolyline([(cs_x+0.025,cy-0.025), (cs_x+bb-0.025,cy-0.025), (cs_x+bb-0.025,cy-bh+0.025), (cs_x+0.025,cy-bh+0.025), (cs_x+0.025,cy-0.025)], dxfattribs={'layer': 'REBAR_TIES'})
+            msp.add_circle((cs_x+0.04, cy-bh+0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_circle((cs_x+bb-0.04, cy-bh+0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_circle((cs_x+0.04, cy-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_circle((cs_x+bb-0.04, cy-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+            
+            add_dim((cs_x, cy+0.1), (cs_x+bb, cy+0.1), 0.3, f"{int(bb*1000)}")
+            add_dim((cs_x+bb+0.1, cy-bh), (cs_x+bb+0.1, cy), 0.3, f"{int(bh*1000)}", True)
+            msp.add_text("BEAM C/S", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cs_x, cy - bh - 0.4))
+            msp.add_text(f"Top: {b_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((cs_x, cy - bh - 0.6))
+            msp.add_text(f"Bot: {b_det['Bot Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((cs_x, cy - bh - 0.8))
+            msp.add_text(f"Stirrups: {b_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((cs_x, cy - bh - 1.0))
 
-        # 2C. Footing Detail (Elevation)
+        # 2C. Footing Detail (Plan & Elev)
         if footing_results:
             f_det = footing_results[0]
             fl = float(f_det['Size'].split('x')[0])
             fd = f_det['D(mm)'] / 1000.0
-            cx, cy = det_x + 2.0, max_y - 5.0
-            # Concrete Profile (stepped)
-            msp.add_lwpolyline([(cx,cy), (cx+fl,cy), (cx+fl,cy+0.15), (cx+fl/2+0.2,cy+fd), (cx+fl/2-0.2,cy+fd), (cx,cy+0.15), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            # Column Stub
-            msp.add_lwpolyline([(cx+fl/2-0.15,cy+fd), (cx+fl/2-0.15,cy+fd+0.5), (cx+fl/2+0.15,cy+fd+0.5), (cx+fl/2+0.15,cy+fd)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            # Bottom Mesh
-            msp.add_line((cx+0.05, cy+0.05), (cx+fl-0.05, cy+0.05), dxfattribs={'layer': 'REBAR_MAIN'})
-            for i in range(10): # Rep dots
-                msp.add_circle((cx+0.05 + i*(fl-0.1)/9, cy+0.065), radius=0.01, dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_text("ISOLATED FOOTING SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.5))
-            msp.add_text(f"Depth: {int(fd*1000)}mm", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
-            msp.add_text(f"Mesh: {f_det['Mesh']} (B/W)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.0))
+            cx, cy = det_x, max_y - 7.0
+            
+            # Plan
+            msp.add_lwpolyline([(cx, cy), (cx+fl, cy), (cx+fl, cy-fl), (cx, cy-fl), (cx, cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_lwpolyline([(cx+fl/2-0.15, cy-fl/2+0.22), (cx+fl/2+0.15, cy-fl/2+0.22), (cx+fl/2+0.15, cy-fl/2-0.22), (cx+fl/2-0.15, cy-fl/2-0.22), (cx+fl/2-0.15, cy-fl/2+0.22)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            spc = float(f_det['Mesh'].split('@')[1].replace('c/c','').strip()) / 1000.0
+            for i in range(int(fl/spc)):
+                msp.add_line((cx+0.05+(i*spc), cy-0.05), (cx+0.05+(i*spc), cy-fl+0.05), dxfattribs={'layer': 'REBAR_MAIN'})
+                msp.add_line((cx+0.05, cy-0.05-(i*spc)), (cx+fl-0.05, cy-0.05-(i*spc)), dxfattribs={'layer': 'REBAR_MAIN'})
+            add_dim((cx, cy+0.1), (cx+fl, cy+0.1), 0.4, f"{fl}m")
+            add_dim((cx-0.1, cy-fl), (cx-0.1, cy), -0.4, f"{fl}m", True)
+            msp.add_text("FOOTING TOP VIEW (PLAN)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - fl - 0.4))
+            
+            # Elevation
+            ex, ey = cx + fl + 2.0, cy - fl
+            msp.add_lwpolyline([(ex, ey), (ex+fl, ey), (ex+fl, ey+0.15), (ex+fl/2+0.15, ey+fd), (ex+fl/2-0.15, ey+fd), (ex, ey+0.15), (ex, ey)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_lwpolyline([(ex+fl/2-0.15, ey+fd), (ex+fl/2-0.15, ey+fd+0.8), (ex+fl/2+0.15, ey+fd+0.8), (ex+fl/2+0.15, ey+fd)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_line((ex+0.05, ey+0.05), (ex+fl-0.05, ey+0.05), dxfattribs={'layer': 'REBAR_MAIN'}) 
+            for i in range(12): msp.add_circle((ex+0.05+i*(fl-0.1)/11, ey+0.065), radius=0.01, dxfattribs={'layer': 'REBAR_MAIN'}) 
+            # Column Starter Bars
+            msp.add_line((ex+fl/2-0.1, ey+fd+0.8), (ex+fl/2-0.1, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_line((ex+fl/2-0.1, ey+0.06), (ex+fl/2-0.3, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'}) 
+            msp.add_line((ex+fl/2+0.1, ey+fd+0.8), (ex+fl/2+0.1, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_line((ex+fl/2+0.1, ey+0.06), (ex+fl/2+0.3, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'}) 
+            
+            add_dim((ex+fl+0.1, ey), (ex+fl+0.1, ey+fd), 0.4, f"D={int(fd*1000)}", True)
+            add_dim((ex, ey-0.1), (ex+fl, ey-0.1), -0.4, f"L={fl}m")
+            msp.add_text("FOOTING SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((ex, ey - 0.8))
+            msp.add_text(f"Bot Biaxial Mesh: {f_det['Mesh']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((ex, ey - 1.1))
 
         # 2D. Slab Detail (Section)
-        cx, cy = det_x + 6.0, max_y - 5.0
+        cx, cy = det_x + 9.0, max_y - 7.0
         sd = slab_thick / 1000.0
-        msp.add_lwpolyline([(cx,cy), (cx+3.0,cy), (cx+3.0,cy+sd), (cx,cy+sd), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-        msp.add_line((cx+0.02, cy+0.02), (cx+2.98, cy+0.02), dxfattribs={'layer': 'REBAR_MAIN'}) # Bottom Main
-        msp.add_line((cx+0.02, cy+sd-0.02), (cx+0.8, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) # Top Extra Left
-        msp.add_line((cx+2.2, cy+sd-0.02), (cx+2.98, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) # Top Extra Right
-        msp.add_text(f"SLAB SECTION (Thickness: {slab_thick}mm)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.5))
-        msp.add_text(f"Bot Mesh: T10 @ {int(spc_pos)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
-        msp.add_text(f"Top Extra: T10 @ {int(spc_neg)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.0))
+        msp.add_lwpolyline([(cx,cy), (cx+4.0,cy), (cx+4.0,cy+sd), (cx,cy+sd), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+        msp.add_line((cx+0.02, cy+0.02), (cx+3.98, cy+0.02), dxfattribs={'layer': 'REBAR_MAIN'}) 
+        msp.add_line((cx+0.02, cy+sd-0.02), (cx+1.0, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) 
+        msp.add_line((cx+3.0, cy+sd-0.02), (cx+3.98, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) 
+        add_dim((cx+4.1, cy), (cx+4.1, cy+sd), 0.3, f"{slab_thick}mm", True)
+        msp.add_text(f"SLAB SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.4))
+        msp.add_text(f"Bot Mesh: T10 @ {int(spc_pos)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.6))
+        msp.add_text(f"Top Extra: T10 @ {int(spc_neg)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
 
         # Save DXF to buffer
         fd, path = tempfile.mkstemp(suffix=".dxf")
