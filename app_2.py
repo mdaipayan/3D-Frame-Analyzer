@@ -12,7 +12,7 @@ import ezdxf
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer & Designer", layout="wide")
 st.title("🏗️ 3D Frame Analysis & Complete Building Design")
-st.caption("Audited: 3D Viewport | PDF Export | LibreCAD DXF Export | BBS")
+st.caption("Audited: 3D Viewport | PDF Export | LibreCAD DXF (With Rebar Detailing) | BBS")
 
 # --- INITIALIZE STATE ---
 if 'grids' not in st.session_state:
@@ -36,17 +36,13 @@ mapping = {"Floors": "floors", "X-Grids": "x_grids", "Y-Grids": "y_grids", "Colu
 active_key = mapping[csv_choice]
 
 csv_data = st.session_state[active_key].to_csv(index=False).encode('utf-8')
-st.sidebar.download_button(
-    label=f"⬇️ Download {csv_choice} (CSV)",
-    data=csv_data, file_name=f"{active_key}_template.csv", mime="text/csv", width="stretch"
-)
+st.sidebar.download_button(label=f"⬇️ Download {csv_choice} (CSV)", data=csv_data, file_name=f"{active_key}_template.csv", mime="text/csv", width="stretch")
 
 uploaded_csv = st.sidebar.file_uploader(f"⬆️ Upload {csv_choice} (CSV)", type=["csv"])
 if uploaded_csv is not None:
     if st.session_state.last_uploaded.get(csv_choice) != uploaded_csv.name:
         try:
-            new_df = pd.read_csv(uploaded_csv)
-            st.session_state[active_key] = new_df
+            st.session_state[active_key] = pd.read_csv(uploaded_csv)
             st.session_state.last_uploaded[csv_choice] = uploaded_csv.name
             st.rerun()
         except Exception as e:
@@ -115,18 +111,15 @@ class PDFReport(FPDF):
         self.cell(0, 8, 'Structural Engineer: Mr. D. Mandal, M.Tech. Structures', ln=1, align='R')
         self.line(10, self.get_y(), 200, self.get_y())
         self.ln(5)
-
     def footer(self):
         self.set_y(-15)
         self.set_font('Arial', 'I', 8)
         self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
-
     def chapter_title(self, title):
         self.set_font('Arial', 'B', 12)
         self.set_fill_color(200, 220, 255)
         self.cell(0, 8, title, 0, 1, 'L', 1)
         self.ln(4)
-
     def build_table(self, dataframe):
         self.set_font('Arial', 'B', 8)
         col_width = 190 / len(dataframe.columns)
@@ -159,7 +152,6 @@ def get_rebar_detail(ast_req, member_type="Beam"):
         for i in range(1, len(dias)):
             for n_face in [2, 4, 6, 8]:
                 configs.append((4, dias[i], n_face, dias[i-1], 4*areas[dias[i]] + n_face*areas[dias[i-1]]))
-
     configs.sort(key=lambda x: x[4])
     for c in configs:
         if c[4] >= ast_req:
@@ -549,30 +541,29 @@ if st.button("🚀 Execute Complete Analysis & Generate CAD / PDF", type="primar
         pdf.cell(0, 10, f'TOTAL STEEL TONNAGE REQUIRED: {total_wt_kg / 1000.0:.2f} Metric Tons', 0, 1, 'R')
         pdf_bytes = pdf.output(dest='S').encode('latin-1')
 
-        # --- GENERATE DXF (LibreCAD/AutoCAD) ---
+        # --- GENERATE DXF (LibreCAD/AutoCAD WITH REBAR DETAILS) ---
         doc = ezdxf.new('R2010')
         msp = doc.modelspace()
         doc.layers.add('GRIDS', color=8)
-        doc.layers.add('COLUMNS', color=1)
-        doc.layers.add('BEAMS', color=5)
+        doc.layers.add('CONCRETE_OUTLINE', color=2)
+        doc.layers.add('REBAR_MAIN', color=1)
+        doc.layers.add('REBAR_TIES', color=3)
         doc.layers.add('ANNOTATIONS', color=7)
         
         max_x = max(x_coords_sorted) if x_coords_sorted else 10
         max_y = max(y_coords_sorted) if y_coords_sorted else 10
         offset_x = max_x + 5.0 
         
+        # 1. Draw Floor Framing Plans
         for idx, row in floors_df.iterrows():
             f_num = int(row['Floor'])
             bx = idx * offset_x 
-            
             msp.add_text(f"FLOOR {f_num} STRUCTURAL FRAMING PLAN", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.4}).set_placement((bx, max_y + 2.0))
-            
             for _, gx in x_grids_df.iterrows():
                 x = bx + float(gx['X_Coord (m)'])
                 msp.add_line((x, -1.5), (x, max_y + 1.5), dxfattribs={'layer': 'GRIDS'})
                 msp.add_circle((x, max_y + 1.9), radius=0.4, dxfattribs={'layer': 'GRIDS'})
                 msp.add_text(str(gx['Grid_ID']), dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.3}).set_placement((x - 0.12, max_y + 1.75))
-                
             for _, gy in y_grids_df.iterrows():
                 y = float(gy['Y_Coord (m)'])
                 msp.add_line((bx - 1.5, y), (bx + max_x + 1.5, y), dxfattribs={'layer': 'GRIDS'})
@@ -583,7 +574,7 @@ if st.button("🚀 Execute Complete Analysis & Generate CAD / PDF", type="primar
             f_cols = [el for el in elements if el['type'] == 'Column' and el['nj_n']['floor'] == f_num]
             for col in f_cols:
                 cx, cy = bx + col['nj_n']['x'], col['nj_n']['y']
-                msp.add_lwpolyline([(cx - col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy - col_h_m/2)], dxfattribs={'layer': 'COLUMNS'})
+                msp.add_lwpolyline([(cx - col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy - col_h_m/2)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
                 msp.add_text(f"C", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx + col_b_m/2 + 0.1, cy + col_h_m/2 + 0.1))
                 
             beam_b_m, beam_h_m = map(lambda val: float(val)/1000.0, beam_size.split('x'))
@@ -591,30 +582,104 @@ if st.button("🚀 Execute Complete Analysis & Generate CAD / PDF", type="primar
             for beam in f_beams:
                 nx1, ny1 = bx + beam['ni_n']['x'], beam['ni_n']['y']
                 nx2, ny2 = bx + beam['nj_n']['x'], beam['nj_n']['y']
-                
                 if abs(ny1 - ny2) < 0.01:
-                    msp.add_line((nx1, ny1 + beam_b_m/2), (nx2, ny2 + beam_b_m/2), dxfattribs={'layer': 'BEAMS'})
-                    msp.add_line((nx1, ny1 - beam_b_m/2), (nx2, ny2 - beam_b_m/2), dxfattribs={'layer': 'BEAMS'})
+                    msp.add_line((nx1, ny1 + beam_b_m/2), (nx2, ny2 + beam_b_m/2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                    msp.add_line((nx1, ny1 - beam_b_m/2), (nx2, ny2 - beam_b_m/2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
                 else: 
-                    msp.add_line((nx1 + beam_b_m/2, ny1), (nx2 + beam_b_m/2, ny2), dxfattribs={'layer': 'BEAMS'})
-                    msp.add_line((nx1 - beam_b_m/2, ny1), (nx2 - beam_b_m/2, ny2), dxfattribs={'layer': 'BEAMS'})
+                    msp.add_line((nx1 + beam_b_m/2, ny1), (nx2 + beam_b_m/2, ny2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                    msp.add_line((nx1 - beam_b_m/2, ny1), (nx2 - beam_b_m/2, ny2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
                 msp.add_text(f"B", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement(((nx1+nx2)/2 + 0.1, (ny1+ny2)/2 + 0.1))
 
+        # 2. Draw Typical Reinforcement Details Section
+        det_x = len(floors_df) * offset_x + 2.0
+        msp.add_text("TYPICAL REINFORCEMENT SECTIONS (IS 456)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.6}).set_placement((det_x, max_y + 2.0))
+        
+        # 2A. Column Detail (Pulling max designed column)
+        col_list = [d for d in design_data if d['Type'] == 'Column']
+        if col_list:
+            c_det = col_list[0] # Grab highest floor typical column
+            cb, ch = map(lambda x: float(x)/1000.0, c_det['Size'].split('x'))
+            cx, cy = det_x + 2.0, max_y - 1.0
+            msp.add_lwpolyline([(cx,cy), (cx+cb,cy), (cx+cb,cy+ch), (cx,cy+ch), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_lwpolyline([(cx+0.04,cy+0.04), (cx+cb-0.04,cy+0.04), (cx+cb-0.04,cy+ch-0.04), (cx+0.04,cy+ch-0.04), (cx+0.04,cy+0.04)], dxfattribs={'layer': 'REBAR_TIES'})
+            
+            bars = parse_rebar_string(c_det['Top Rebar'])
+            total_bars = sum([b[0] for b in bars]) if bars else 4
+            # Draw 4 corner bars
+            r = 0.015
+            for px, py in [(cx+0.05,cy+0.05), (cx+cb-0.05,cy+0.05), (cx+cb-0.05,cy+ch-0.05), (cx+0.05,cy+ch-0.05)]:
+                msp.add_circle((px, py), radius=r, dxfattribs={'layer': 'REBAR_MAIN'})
+            # Add side bars if > 4
+            if total_bars > 4:
+                msp.add_circle((cx+cb/2, cy+0.05), radius=r, dxfattribs={'layer': 'REBAR_MAIN'})
+                msp.add_circle((cx+cb/2, cy+ch-0.05), radius=r, dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_text(f"TYPICAL COLUMN: {c_det['Size']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.5))
+            msp.add_text(f"Main: {c_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
+            msp.add_text(f"Ties: {c_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.0))
+
+        # 2B. Beam Detail
+        bm_list = [d for d in design_data if d['Type'] == 'Beam']
+        if bm_list:
+            b_det = bm_list[0]
+            bb, bh = map(lambda x: float(x)/1000.0, b_det['Size'].split('x'))
+            cx, cy = det_x + 6.0, max_y - 1.0
+            msp.add_lwpolyline([(cx,cy), (cx+bb,cy), (cx+bb,cy+bh), (cx,cy+bh), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_lwpolyline([(cx+0.025,cy+0.025), (cx+bb-0.025,cy+0.025), (cx+bb-0.025,cy+bh-0.025), (cx+0.025,cy+bh-0.025), (cx+0.025,cy+0.025)], dxfattribs={'layer': 'REBAR_TIES'})
+            # 2 Top Hangers
+            msp.add_circle((cx+0.04, cy+bh-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_circle((cx+bb-0.04, cy+bh-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+            # Bottom Main Bars
+            bot_bars = parse_rebar_string(b_det['Bot Rebar'])
+            n_bot = bot_bars[0][0] if bot_bars else 3
+            for i in range(n_bot):
+                px = cx + 0.04 + (i * ((bb - 0.08) / max(n_bot-1, 1)))
+                msp.add_circle((px, cy+0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_text(f"TYPICAL BEAM: {b_det['Size']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.5))
+            msp.add_text(f"Bot Main: {b_det['Bot Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
+            msp.add_text(f"Top Extra: {b_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.0))
+            msp.add_text(f"Stirrups: {b_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.2))
+
+        # 2C. Footing Detail (Elevation)
+        if footing_results:
+            f_det = footing_results[0]
+            fl = float(f_det['Size'].split('x')[0])
+            fd = f_det['D(mm)'] / 1000.0
+            cx, cy = det_x + 2.0, max_y - 5.0
+            # Concrete Profile (stepped)
+            msp.add_lwpolyline([(cx,cy), (cx+fl,cy), (cx+fl,cy+0.15), (cx+fl/2+0.2,cy+fd), (cx+fl/2-0.2,cy+fd), (cx,cy+0.15), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            # Column Stub
+            msp.add_lwpolyline([(cx+fl/2-0.15,cy+fd), (cx+fl/2-0.15,cy+fd+0.5), (cx+fl/2+0.15,cy+fd+0.5), (cx+fl/2+0.15,cy+fd)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            # Bottom Mesh
+            msp.add_line((cx+0.05, cy+0.05), (cx+fl-0.05, cy+0.05), dxfattribs={'layer': 'REBAR_MAIN'})
+            for i in range(10): # Rep dots
+                msp.add_circle((cx+0.05 + i*(fl-0.1)/9, cy+0.065), radius=0.01, dxfattribs={'layer': 'REBAR_MAIN'})
+            msp.add_text("ISOLATED FOOTING SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.5))
+            msp.add_text(f"Depth: {int(fd*1000)}mm", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
+            msp.add_text(f"Mesh: {f_det['Mesh']} (B/W)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.0))
+
+        # 2D. Slab Detail (Section)
+        cx, cy = det_x + 6.0, max_y - 5.0
+        sd = slab_thick / 1000.0
+        msp.add_lwpolyline([(cx,cy), (cx+3.0,cy), (cx+3.0,cy+sd), (cx,cy+sd), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+        msp.add_line((cx+0.02, cy+0.02), (cx+2.98, cy+0.02), dxfattribs={'layer': 'REBAR_MAIN'}) # Bottom Main
+        msp.add_line((cx+0.02, cy+sd-0.02), (cx+0.8, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) # Top Extra Left
+        msp.add_line((cx+2.2, cy+sd-0.02), (cx+2.98, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) # Top Extra Right
+        msp.add_text(f"SLAB SECTION (Thickness: {slab_thick}mm)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.5))
+        msp.add_text(f"Bot Mesh: T10 @ {int(spc_pos)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
+        msp.add_text(f"Top Extra: T10 @ {int(spc_neg)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 1.0))
+
+        # Save DXF to buffer
         fd, path = tempfile.mkstemp(suffix=".dxf")
         os.close(fd)
         doc.saveas(path)
-        with open(path, "rb") as f:
-            dxf_bytes = f.read()
+        with open(path, "rb") as f: dxf_bytes = f.read()
         os.remove(path)
 
         # --- UI DISPLAY ---
-        st.success("✅ Analysis & Drafting Complete!")
-        
+        st.success("✅ Analysis, PDF Reporting & CAD Drafting Complete!")
         col_dl1, col_dl2 = st.columns(2)
-        with col_dl1:
-            st.download_button(label="📄 Download Production PDF Report", data=pdf_bytes, file_name="Structural_Detailing_Report.pdf", mime="application/pdf", type="primary", width="stretch")
-        with col_dl2:
-            st.download_button(label="📥 Download AutoCAD/LibreCAD Plan (.dxf)", data=dxf_bytes, file_name="Floor_Framing_Plans.dxf", mime="application/dxf", type="primary", width="stretch")
+        with col_dl1: st.download_button(label="📄 Download Production PDF Report", data=pdf_bytes, file_name="Structural_Detailing_Report.pdf", mime="application/pdf", type="primary", width="stretch")
+        with col_dl2: st.download_button(label="📥 Download CAD Plan & Details (.dxf)", data=dxf_bytes, file_name="Floor_Framing_Plans.dxf", mime="application/dxf", type="primary", width="stretch")
             
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Raw Forces", "📐 Main Detailing", "🟦 Slabs & Footings", "🧾 Bar Bending Schedule"])
         
@@ -630,20 +695,13 @@ if st.button("🚀 Execute Complete Analysis & Generate CAD / PDF", type="primar
             st.markdown("### IS 456 Restrained Two-Way Slab Check")
             st.write(f"- **Critical Panel:** {round(Lx,2)}m x {round(Ly,2)}m | **Max Hogging Moment:** {round(Mu_neg, 2)} kN.m")
             st.write(f"- **Required Thickness:** {round(max(d_req_flex, d_req_def)+25, 1)} mm | **Provided:** {slab_thick} mm")
-            
-            if safe_slab: 
-                st.success(f"✅ Slab Safe. \n- **Bot Span Mesh:** T10 @ {int(spc_pos)} c/c\n- **Top Support (Hogging):** T10 @ {int(spc_neg)} c/c\n- **Corner Torsion Mesh:** T10 @ {int(spc_tor)} c/c (over {round(Lx/5.0, 2)}m)")
-            else: 
-                st.error("❌ Slab Fails Deflection or Flexure. Increase Thickness.")
+            if safe_slab: st.success(f"✅ Slab Safe. \n- **Bot Span Mesh:** T10 @ {int(spc_pos)} c/c\n- **Top Support (Hogging):** T10 @ {int(spc_neg)} c/c\n- **Corner Torsion Mesh:** T10 @ {int(spc_tor)} c/c")
+            else: st.error("❌ Slab Fails Deflection or Flexure. Increase Thickness.")
             
             st.divider()
-            
             st.markdown("### Foundation Validation & Isolated Footings")
-            if not clashes:
-                st.success("✅ Foundation Validation Passed: No overlapping soil pressure bulbs.")
-            else:
-                st.error(f"🚨 {len(clashes)} Clash(es) Detected. Footings physically overlap or interact. Use Combined or Raft Foundation.")
-            
+            if not clashes: st.success("✅ Foundation Validation Passed: No overlapping soil pressure bulbs.")
+            else: st.error(f"🚨 {len(clashes)} Clash(es) Detected. Footings physically overlap or interact. Use Combined or Raft Foundation.")
             st.dataframe(pd.DataFrame(footing_results), width="stretch")
                 
         with tab4:
