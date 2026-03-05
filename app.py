@@ -13,7 +13,7 @@ from ezdxf.enums import TextEntityAlignment
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer & Designer", layout="wide")
 st.title("🏗️ 3D Frame Analysis & Complete Building Design")
-st.caption("Audited: 3D Viewport | PDF Export | LibreCAD DXF | BBS | Detailed Estimate")
+st.caption("Audited: 3D Viewport | PDF Export | LibreCAD DXF | BBS | Detailed Estimate | IS 456 Checks")
 
 # --- INITIALIZE STATE ---
 if 'grids' not in st.session_state:
@@ -62,31 +62,12 @@ st.sidebar.header("2. Section Sizes (mm)")
 col_size = st.sidebar.text_input("Column (b x h)", "300x450")
 beam_size = st.sidebar.text_input("Beam (b x h)", "230x400")
 
-# --- LIVE INPUT VALIDATION GATEKEEPER ---
-def validate_size(size_str, name):
-    try:
-        b, h = map(float, size_str.lower().split('x'))
-        if b < 100 or h < 100:
-            return False, f"🚨 {name} dimensions must be ≥ 100mm."
-        return True, ""
-    except:
-        return False, f"🚨 Invalid {name} format. Use 'BxD'."
-
-v_col, msg_col = validate_size(col_size, "Column")
-v_beam, msg_beam = validate_size(beam_size, "Beam")
-
-if not v_col: st.sidebar.error(msg_col)
-if not v_beam: st.sidebar.error(msg_beam)
-
 st.sidebar.header("3. Applied Loads (IS 875)")
 live_load = st.sidebar.number_input("Live Load (kN/m²)", value=3.0)
 floor_finish = st.sidebar.number_input("Floor Finish (kN/m²)", value=1.5)
 slab_thick = st.sidebar.number_input("Slab Thickness (mm)", value=150)
 wall_thick = st.sidebar.number_input("Wall Thickness (mm)", value=230)
 eq_base_shear = st.sidebar.slider("Seismic Base Shear Ah (%)", 0.0, 20.0, 2.5) / 100.0
-
-if slab_thick < 75: st.sidebar.error("🚨 Slab thickness must be ≥ 75mm.")
-valid_inputs = v_col and v_beam and slab_thick >= 75
 
 st.sidebar.header("4. Soil & Footing Parameters")
 sbc = st.sidebar.number_input("Safe Bearing Capacity (kN/m²)", value=150.0, step=10.0)
@@ -171,6 +152,7 @@ def get_rebar_detail(ast_req, member_type="Beam", b_mm=230):
     
     cover = 25 if member_type == "Beam" else 40
     stirrup_d = 8
+    # IS 456 min spacing between parallel bars: max of (dia, 25mm) assuming 20mm max aggregate
     def check_fit(n_bars, max_d):
         min_gap = max(max_d, 25)
         req_width = (2 * cover) + (2 * stirrup_d) + (n_bars * max_d) + ((n_bars - 1) * min_gap)
@@ -186,6 +168,7 @@ def get_rebar_detail(ast_req, member_type="Beam", b_mm=230):
                     if n_main + n_sec <= 6 and check_fit(n_main + n_sec, max(dias[i], dias[i-1])):
                         configs.append((n_main, dias[i], n_sec, dias[i-1], n_main*areas[dias[i]] + n_sec*areas[dias[i-1]]))
     else: 
+        # Columns distribute bars around perimeter
         for d in [12, 16, 20, 25, 32]:
             for n in [4, 6, 8, 10, 12, 16]: configs.append((n, d, 0, 0, n*areas[d]))
         for i in range(1, len(dias)):
@@ -255,12 +238,16 @@ def design_column_is456(b_m, h_m, Pu_kN, Mu_kNm, Vu_kN, Tu_kNm, fck, fy):
     Pu, Me = Pu_kN * 1000, Me_kNm * 1e6 
     Asc_axial = (Pu - 0.4 * fck * Ag) / max(0.67 * fy - 0.4 * fck, 1.0) if Pu > 0.4 * fck * Ag else 0
     Asc_req = max(Asc_axial + (Me / max(0.87 * fy * d, 1.0)), 0.008 * Ag)
-    status = "Safe"
-    if Asc_req > 0.040 * Ag: status = "Over-Reinf"
-    if Pu > (0.45 * fck * Ag + 0.75 * fy * (0.04 * Ag)): status = "Crush"
+    
+    status_flags = []
+    if Asc_req > 0.040 * Ag: status_flags.append("Over-Reinf")
+    if Pu > (0.45 * fck * Ag + 0.75 * fy * (0.04 * Ag)): status_flags.append("Crush")
+    
     sv, shear_stat = calculate_shear_spacing(Ve_kN, b, d, fck, fy, is_column=True)
-    if "Fail" in shear_stat: status += " | Shear Fail"
-    return round(Asc_req, 1), sv, status
+    if "Fail" in shear_stat: status_flags.append("Shear Fail")
+    
+    final_status = "Safe" if not status_flags else " | ".join(status_flags)
+    return round(Asc_req, 1), sv, final_status
 
 # --- ENGINE: BUILD MESH ---
 def build_mesh():
@@ -405,479 +392,506 @@ def transform_matrix(ni, nj, angle_deg):
 
 st.divider()
 
-if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates", type="primary", width="stretch", disabled=not valid_inputs):
-    with st.spinner("Solving Matrix, Running Code Checks & Building CAD Files..."):
-        ndof = len(nodes) * 6
-        K_global = np.zeros((ndof, ndof))
-        F_global = np.zeros(ndof)
-        
-        floor_seismic_W = {z: 0.0 for z in range(1, len(floors_df)+1)}
-        area_dl = (slab_thick/1000.0)*25.0 + floor_finish
-        total_q_area = (f_dl * area_dl) + (f_ll * live_load)
-        
-        for el in elements:
-            if el['type'] == 'Diaphragm': continue
-            ni, nj = next(n for n in nodes if n['id'] == el['ni']), next(n for n in nodes if n['id'] == el['nj'])
-            L = max(math.sqrt((nj['x']-ni['x'])**2 + (nj['y']-ni['y'])**2 + (nj['z']-ni['z'])**2), 0.001)
-            el['L'], el['ni_n'], el['nj_n'] = L, ni, nj
-            el['A'], el['Iy'], el['Iz'], el['J'] = get_props(el['size'], el['type'])
-            
-            if el['type'] == 'Beam': floor_seismic_W[ni['floor']] += (calc_yield_line_udl(ni, nj, el['dir'], area_dl + 0.25*live_load) + (wall_thick/1000.0 * 3.0 * 20.0) + (el['A'] * 25.0)) * L
-            elif el['type'] == 'Column':
-                if ni['floor'] > 0: floor_seismic_W[ni['floor']] += (el['A'] * 25.0 * L) / 2.0
-                if nj['floor'] > 0: floor_seismic_W[nj['floor']] += (el['A'] * 25.0 * L) / 2.0
+# --- THE EXECUTION BUTTON ---
+if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates", type="primary", width="stretch"):
+    
+    # --- 🛑 HARD INPUT VALIDATION GATEKEEPER ---
+    def validate_size(size_str, name):
+        try:
+            b, h = map(float, size_str.lower().split('x'))
+            if b < 100 or h < 100:
+                return False, f"🚨 **Error:** {name} size '{size_str}' is physically impossible. Dimensions must be at least 100mm."
+            return True, ""
+        except:
+            return False, f"🚨 **Error:** Invalid {name} format '{size_str}'. Please use format 'BxD' (e.g., '230x400')."
 
-        for el in elements:
-            if 'L' not in el:
+    v_beam, msg_beam = validate_size(beam_size, "Beam")
+    v_col, msg_col = validate_size(col_size, "Column")
+
+    if not v_beam:
+        st.error(msg_beam)
+    elif not v_col:
+        st.error(msg_col)
+    elif slab_thick < 75:
+        st.error("🚨 **Error:** Slab thickness cannot be less than 75mm.")
+    else:
+        # --- IF VALIDATION PASSES, RUN THE ENGINE ---
+        with st.spinner("Solving Matrix, Running Code Checks & Building CAD Files..."):
+            ndof = len(nodes) * 6
+            K_global = np.zeros((ndof, ndof))
+            F_global = np.zeros(ndof)
+            
+            floor_seismic_W = {z: 0.0 for z in range(1, len(floors_df)+1)}
+            area_dl = (slab_thick/1000.0)*25.0 + floor_finish
+            total_q_area = (f_dl * area_dl) + (f_ll * live_load)
+            
+            for el in elements:
+                if el['type'] == 'Diaphragm': continue
                 ni, nj = next(n for n in nodes if n['id'] == el['ni']), next(n for n in nodes if n['id'] == el['nj'])
-                el['L'] = max(math.sqrt((nj['x']-ni['x'])**2 + (nj['y']-ni['y'])**2 + (nj['z']-ni['z'])**2), 0.001)
+                L = max(math.sqrt((nj['x']-ni['x'])**2 + (nj['y']-ni['y'])**2 + (nj['z']-ni['z'])**2), 0.001)
+                el['L'], el['ni_n'], el['nj_n'] = L, ni, nj
                 el['A'], el['Iy'], el['Iz'], el['J'] = get_props(el['size'], el['type'])
-                el['ni_n'], el['nj_n'] = ni, nj
-            k_glob = transform_matrix(el['ni_n'], el['nj_n'], el['angle']).T @ local_k(el['A'], el['Iy'], el['Iz'], el['J'], el['L']) @ transform_matrix(el['ni_n'], el['nj_n'], el['angle'])
-            idx = [el['ni_n']['id']*6+i for i in range(6)] + [el['nj_n']['id']*6+i for i in range(6)]
-            for r in range(12):
-                for c in range(12): K_global[idx[r], idx[c]] += k_glob[r, c]
+                
+                if el['type'] == 'Beam': floor_seismic_W[ni['floor']] += (calc_yield_line_udl(ni, nj, el['dir'], area_dl + 0.25*live_load) + (wall_thick/1000.0 * 3.0 * 20.0) + (el['A'] * 25.0)) * L
+                elif el['type'] == 'Column':
+                    if ni['floor'] > 0: floor_seismic_W[ni['floor']] += (el['A'] * 25.0 * L) / 2.0
+                    if nj['floor'] > 0: floor_seismic_W[nj['floor']] += (el['A'] * 25.0 * L) / 2.0
+
+            for el in elements:
+                if 'L' not in el:
+                    ni, nj = next(n for n in nodes if n['id'] == el['ni']), next(n for n in nodes if n['id'] == el['nj'])
+                    el['L'] = max(math.sqrt((nj['x']-ni['x'])**2 + (nj['y']-ni['y'])**2 + (nj['z']-ni['z'])**2), 0.001)
+                    el['A'], el['Iy'], el['Iz'], el['J'] = get_props(el['size'], el['type'])
+                    el['ni_n'], el['nj_n'] = ni, nj
+                k_glob = transform_matrix(el['ni_n'], el['nj_n'], el['angle']).T @ local_k(el['A'], el['Iy'], el['Iz'], el['J'], el['L']) @ transform_matrix(el['ni_n'], el['nj_n'], el['angle'])
+                idx = [el['ni_n']['id']*6+i for i in range(6)] + [el['nj_n']['id']*6+i for i in range(6)]
+                for r in range(12):
+                    for c in range(12): K_global[idx[r], idx[c]] += k_glob[r, c]
+                        
+                if el['type'] == 'Beam':
+                    w = calc_yield_line_udl(el['ni_n'], el['nj_n'], el['dir'], total_q_area) + (f_dl * wall_thick/1000.0 * 3.0 * 20.0) + (f_dl * el['A'] * 25.0)
+                    el['applied_w'] = w 
+                    V, M = (w * el['L']) / 2.0, (w * el['L']**2) / 12.0
+                    F_loc = np.zeros(12); F_loc[1], F_loc[5], F_loc[7], F_loc[11] = V, M, V, -M
+                    F_g = transform_matrix(el['ni_n'], el['nj_n'], el['angle']).T @ F_loc
+                    for i in range(12): F_global[idx[i]] -= F_g[i]
                     
-            if el['type'] == 'Beam':
-                w = calc_yield_line_udl(el['ni_n'], el['nj_n'], el['dir'], total_q_area) + (f_dl * wall_thick/1000.0 * 3.0 * 20.0) + (f_dl * el['A'] * 25.0)
-                el['applied_w'] = w 
-                V, M = (w * el['L']) / 2.0, (w * el['L']**2) / 12.0
-                F_loc = np.zeros(12); F_loc[1], F_loc[5], F_loc[7], F_loc[11] = V, M, V, -M
-                F_g = transform_matrix(el['ni_n'], el['nj_n'], el['angle']).T @ F_loc
-                for i in range(12): F_global[idx[i]] -= F_g[i]
-                
-        if f_eq > 0:
-            Vb = eq_base_shear * sum(floor_seismic_W.values()) * f_eq
-            sum_wh2 = sum([floor_seismic_W[z] * (z_elevs[z]**2) for z in floor_seismic_W])
-            for z in range(1, len(floors_df)+1):
-                if sum_wh2 > 0 and z in diaphragm_nodes: F_global[diaphragm_nodes[z]['id'] * 6] += Vb * (floor_seismic_W[z] * (z_elevs[z]**2)) / sum_wh2
+            if f_eq > 0:
+                Vb = eq_base_shear * sum(floor_seismic_W.values()) * f_eq
+                sum_wh2 = sum([floor_seismic_W[z] * (z_elevs[z]**2) for z in floor_seismic_W])
+                for z in range(1, len(floors_df)+1):
+                    if sum_wh2 > 0 and z in diaphragm_nodes: F_global[diaphragm_nodes[z]['id'] * 6] += Vb * (floor_seismic_W[z] * (z_elevs[z]**2)) / sum_wh2
 
-        fixed = [n['id']*6 + d for n in nodes if n['z'] == 0 for d in range(6)]
-        free = sorted(list(set(range(ndof)) - set(fixed)))
-        U_glob = np.zeros(ndof)
-        if len(free) > 0: U_glob[free] = np.linalg.lstsq(K_global[np.ix_(free, free)], F_global[free], rcond=None)[0]
-        
-        analysis_data, design_data, bbs_records = [], [], []
-        base_reactions = {}
-
-        for el in elements:
-            if el['type'] == 'Diaphragm': continue
-            T = transform_matrix(el['ni_n'], el['nj_n'], el['angle'])
-            k_loc = local_k(el['A'], el['Iy'], el['Iz'], el['J'], el['L'])
-            i_dof, j_dof = el['ni_n']['id'] * 6, el['nj_n']['id'] * 6
-            f_int = k_loc @ (T @ np.concatenate((U_glob[i_dof:i_dof+6], U_glob[j_dof:j_dof+6])))
+            fixed = [n['id']*6 + d for n in nodes if n['z'] == 0 for d in range(6)]
+            free = sorted(list(set(range(ndof)) - set(fixed)))
+            U_glob = np.zeros(ndof)
+            if len(free) > 0: U_glob[free] = np.linalg.lstsq(K_global[np.ix_(free, free)], F_global[free], rcond=None)[0]
             
-            axial = max(abs(f_int[0]), abs(f_int[6]))
-            shear = max(abs(f_int[1]), abs(f_int[2]), abs(f_int[7]), abs(f_int[8]))
-            torsion_max = max(abs(f_int[3]), abs(f_int[9]))
-            Mu_neg_max = max(abs(f_int[5]), abs(f_int[11]))
-            Mu_pos_max = 0.0
-            
-            if el['type'] == 'Beam' and 'applied_w' in el:
-                w, Vy_i = el['applied_w'], f_int[1] 
-                x_max = Vy_i / max(w, 0.001) if w > 0 else -1
-                if 0 < x_max < el['L']: Mu_pos_max = abs(f_int[5] + (Vy_i * x_max) - (0.5 * w * x_max**2))
+            analysis_data, design_data, bbs_records = [], [], []
+            base_reactions = {}
 
-            if el['type'] == 'Column' and el['ni_n']['z'] == 0:
-                base_reactions[el['ni_n']['id']] = {'Pu': abs(f_int[0]), 'Col_Size': el['size'], 'x': el['ni_n']['x'], 'y': el['ni_n']['y']}
-
-            analysis_data.append({"ID": f"M{el['id']}", "Type": el['type'], "Flr": el['ni_n']['floor'], "L(m)": round(el['L'],2), "P(kN)": round(axial,1), "V(kN)": round(shear,1), "M(kN.m)": round(max(Mu_pos_max, Mu_neg_max),1)})
-            b_m, h_m = map(lambda x: float(x)/1000.0, el['size'].split('x'))
-            if el['type'] == 'Beam':
-                req_ast_bot, req_ast_top, sv_mm, stat = design_beam_is456(el['L'], b_m, h_m, Mu_pos_max, Mu_neg_max, shear, torsion_max, fck, fy)
-                rebar_bot, rebar_top = get_rebar_detail(req_ast_bot, "Beam", b_m*1000), get_rebar_detail(req_ast_top, "Beam", b_m*1000)
-                design_data.append({"ID": f"M{el['id']}", "Type": "Beam", "Flr": el['ni_n']['floor'], "Size": el['size'], "Bot Rebar": rebar_bot, "Top Rebar": rebar_top, "Ties": f"T8@{sv_mm}", "Status": stat})
+            for el in elements:
+                if el['type'] == 'Diaphragm': continue
+                T = transform_matrix(el['ni_n'], el['nj_n'], el['angle'])
+                k_loc = local_k(el['A'], el['Iy'], el['Iz'], el['J'], el['L'])
+                i_dof, j_dof = el['ni_n']['id'] * 6, el['nj_n']['id'] * 6
+                f_int = k_loc @ (T @ np.concatenate((U_glob[i_dof:i_dof+6], U_glob[j_dof:j_dof+6])))
                 
-                for (count, dia) in parse_rebar_string(rebar_bot):
-                    cut_L = el['L'] - 0.05 + (50 * dia/1000.0) 
-                    bbs_records.append({"Element": f"M{el['id']} (B)", "Type": "Bot Span", "Dia": dia, "No": count, "Cut L(m)": round(cut_L, 2), "Wt(kg)": round((dia**2/162.0)*cut_L*count, 2)})
-                for (count, dia) in parse_rebar_string(rebar_top):
-                    cut_L = el['L'] - 0.05 + (50 * dia/1000.0) 
-                    bbs_records.append({"Element": f"M{el['id']} (B)", "Type": "Top Support", "Dia": dia, "No": count, "Cut L(m)": round(cut_L, 2), "Wt(kg)": round((dia**2/162.0)*cut_L*count, 2)})
+                axial = max(abs(f_int[0]), abs(f_int[6]))
+                shear = max(abs(f_int[1]), abs(f_int[2]), abs(f_int[7]), abs(f_int[8]))
+                torsion_max = max(abs(f_int[3]), abs(f_int[9]))
+                Mu_neg_max = max(abs(f_int[5]), abs(f_int[11]))
+                Mu_pos_max = 0.0
                 
-                hanger_dia = 10 if b_m <= 0.25 else 12 
-                hanger_L = el['L'] - 0.05 + (50 * hanger_dia/1000.0)
-                bbs_records.append({"Element": f"M{el['id']} (B)", "Type": "Hanger", "Dia": hanger_dia, "No": 2, "Cut L(m)": round(hanger_L, 2), "Wt(kg)": round((hanger_dia**2/162.0)*hanger_L*2, 2)})
+                if el['type'] == 'Beam' and 'applied_w' in el:
+                    w, Vy_i = el['applied_w'], f_int[1] 
+                    x_max = Vy_i / max(w, 0.001) if w > 0 else -1
+                    if 0 < x_max < el['L']: Mu_pos_max = abs(f_int[5] + (Vy_i * x_max) - (0.5 * w * x_max**2))
 
-            else:
-                req_ast, sv_mm, stat = design_column_is456(b_m, h_m, axial, max(Mu_neg_max, Mu_pos_max), shear, torsion_max, fck, fy)
-                rebar_str = get_rebar_detail(req_ast, "Column", b_m*1000)
-                design_data.append({"ID": f"M{el['id']}", "Type": "Column", "Flr": el['ni_n']['floor'], "Size": el['size'], "Bot Rebar": "-", "Top Rebar": rebar_str, "Ties": f"T8@{sv_mm}", "Status": stat})
-                for (count, dia) in parse_rebar_string(rebar_str):
-                    cut_L = el['L'] + (50 * dia/1000.0) 
-                    bbs_records.append({"Element": f"M{el['id']} (C)", "Type": "Main Vert", "Dia": dia, "No": count, "Cut L(m)": round(cut_L, 2), "Wt(kg)": round((dia**2/162.0)*cut_L*count, 2)})
+                if el['type'] == 'Column' and el['ni_n']['z'] == 0:
+                    base_reactions[el['ni_n']['id']] = {'Pu': abs(f_int[0]), 'Col_Size': el['size'], 'x': el['ni_n']['x'], 'y': el['ni_n']['y']}
 
-            s_cut = 2*(b_m - 0.05 + h_m - 0.05) + (24 * 0.008) if el['type'] == 'Beam' else 2*(b_m - 0.08 + h_m - 0.08) + (24 * 0.008)
-            n_st = int(el['L'] / (sv_mm / 1000.0)) + 1
-            bbs_records.append({"Element": f"M{el['id']}", "Type": "Tie/Stirrup", "Dia": 8, "No": n_st, "Cut L(m)": round(s_cut, 2), "Wt(kg)": round((8**2/162.0)*s_cut*n_st, 2)})
-
-        # --- SLAB CHECK & FOOTING DESIGN ---
-        x_spans = [x_coords_sorted[i+1] - x_coords_sorted[i] for i in range(len(x_coords_sorted)-1) if (x_coords_sorted[i+1] - x_coords_sorted[i]) > 0.1]
-        y_spans = [y_coords_sorted[i+1] - y_coords_sorted[i] for i in range(len(y_coords_sorted)-1) if (y_coords_sorted[i+1] - y_coords_sorted[i]) > 0.1]
-        Lx, Ly = max(min(x_spans) if x_spans else 1.0, 0.001), max(max(y_spans) if y_spans else 1.0, 0.001)
-        ratio = Ly / Lx
-        alpha_pos = np.interp(ratio, [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0], [0.032, 0.037, 0.043, 0.047, 0.051, 0.053, 0.060, 0.065]) if ratio <= 2.0 else 0.125
-        alpha_neg = np.interp(ratio, [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0], [0.043, 0.048, 0.057, 0.064, 0.068, 0.072, 0.080, 0.087]) if ratio <= 2.0 else 0.125
-        w_u_slab = 1.5 * (live_load + floor_finish + (slab_thick/1000.0)*25.0)
-        Mu_pos, Mu_neg = alpha_pos * w_u_slab * (Lx**2), alpha_neg * w_u_slab * (Lx**2)
-        d_eff_slab = max(slab_thick - 25, 1.0)
-        spc_pos = min(math.floor(1000 / (max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_pos*1e6)/(max(fck,1.0)*1000*d_eff_slab**2),0)))*1000*d_eff_slab, 0.0012*1000*slab_thick) / 78.5) / 10)*10, 300) 
-        spc_neg = min(math.floor(1000 / (max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_neg*1e6)/(max(fck,1.0)*1000*d_eff_slab**2),0)))*1000*d_eff_slab, 0.0012*1000*slab_thick) / 78.5) / 10)*10, 300) 
-        spc_tor = min(math.floor(1000 / (0.75 * max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_pos*1e6)/(max(fck,1.0)*1000*d_eff_slab**2),0)))*1000*d_eff_slab, 0.0012*1000*slab_thick) / 78.5) / 10)*10, 300)
-        
-        d_req_flex = math.sqrt((max(Mu_pos, Mu_neg) * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * 1000))
-        d_req_def = (Lx * 1000) / 28.0 
-        safe_slab = slab_thick >= max(d_req_flex, d_req_def) + 25
-
-        for flr in range(1, len(floors_df)+1):
-            n_main, l_main = int(Ly / (spc_pos/1000.0)) + 1, Lx + 1.0
-            n_dist, l_dist = int(Lx / 0.20) + 1, Ly + 1.0
-            bbs_records.append({"Element": f"Slab F{flr}", "Type": "Bot Main", "Dia": 10, "No": n_main, "Cut L(m)": round(l_main,2), "Wt(kg)": round((10**2/162.0)*l_main*n_main,2)})
-            bbs_records.append({"Element": f"Slab F{flr}", "Type": "Bot Dist", "Dia": 10, "No": n_dist, "Cut L(m)": round(l_dist,2), "Wt(kg)": round((10**2/162.0)*l_dist*n_dist,2)})
-            n_top, l_top = int(Ly / (spc_neg/1000.0)) + 1, 0.6 * Lx
-            bbs_records.append({"Element": f"Slab F{flr}", "Type": "Top Supp", "Dia": 10, "No": n_top*2, "Cut L(m)": round(l_top,2), "Wt(kg)": round((10**2/162.0)*l_top*(n_top*2),2)})
-            n_tor = int((Lx/5.0) / (spc_tor/1000.0)) * 2 
-            bbs_records.append({"Element": f"Slab F{flr}", "Type": "Corner Tor", "Dia": 10, "No": n_tor*4, "Cut L(m)": round(Lx/5.0,2), "Wt(kg)": round((10**2/162.0)*(Lx/5.0)*(n_tor*4),2)})
-
-        footing_geoms, footing_results = {}, []
-        for nid, data in base_reactions.items():
-            P_service = data['Pu'] / 1.5
-            Side_L = max(math.ceil(math.sqrt((P_service * 1.1) / max(sbc, 1.0)) * 10) / 10.0, 1.0)
-            footing_geoms[nid] = {'x': data['x'], 'y': data['y'], 'L': Side_L}
-            col_b, col_h = map(lambda x: float(x)/1000.0, data['Col_Size'].split('x'))
-            net_upward = data['Pu'] / (Side_L**2)
-            Mu_footing = net_upward * Side_L * (max((Side_L - max(col_b, col_h)) / 2.0, 0.01)**2) / 2.0
-            d_req_flex = math.sqrt((Mu_footing * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * (Side_L*1000)))
-            D_prov = max(300, math.ceil((d_req_flex + 50) / 50.0) * 50)
-            d_eff = D_prov - 50 
-            while True:
-                d_m = d_eff / 1000.0
-                V_punch = max(data['Pu'] - (net_upward * (col_b + d_m) * (col_h + d_m)), 0)
-                if (V_punch * 1000) / (2 * ((col_b + d_m) + (col_h + d_m)) * 1000 * d_eff) <= min(0.5 + (min(col_b, col_h) / max(col_b, col_h)), 1.0) * 0.25 * math.sqrt(max(fck, 1.0)): break
-                D_prov += 50; d_eff = D_prov - 50
-            ftg_spacing = min(math.floor(1000 / (max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_footing*1e6)/(max(fck,1.0)*(Side_L*1000)*d_eff**2),0)))*(Side_L*1000)*d_eff, 0.0012*(Side_L*1000)*D_prov) / Side_L / 113.1) / 10)*10, 300)
-            footing_results.append({"Node": f"N{nid}", "P(kN)": round(data['Pu'], 1), "Size": f"{Side_L}x{Side_L}", "D(mm)": int(D_prov), "Mesh": f"T12@{int(ftg_spacing)}"})
-            num_ftg, l_ftg = int((Side_L - 0.1) / (ftg_spacing/1000.0)) + 1, (Side_L - 0.1) + 2*(D_prov/1000.0 - 0.1)
-            bbs_records.append({"Element": f"Foot N{nid}", "Type": "Base Mesh", "Dia": 12, "No": num_ftg*2, "Cut L(m)": round(l_ftg,2), "Wt(kg)": round((12**2/162.0)*l_ftg*(num_ftg*2),2)})
-
-        clashes, processed = [], set()
-        node_ids = list(footing_geoms.keys())
-        for i in range(len(node_ids)):
-            for j in range(i+1, len(node_ids)):
-                n1, n2 = node_ids[i], node_ids[j]
-                if n1 in processed or n2 in processed: continue
-                f1, f2 = footing_geoms[n1], footing_geoms[n2]
-                dist = math.hypot(f1['x'] - f2['x'], f1['y'] - f2['y'])
-                if dist < (f1['L'] / 2.0) + (f2['L'] / 2.0):
-                    clashes.append((n1, n2)); processed.add(n1); processed.add(n2)
+                analysis_data.append({"ID": f"M{el['id']}", "Type": el['type'], "Flr": el['ni_n']['floor'], "L(m)": round(el['L'],2), "P(kN)": round(axial,1), "V(kN)": round(shear,1), "M(kN.m)": round(max(Mu_pos_max, Mu_neg_max),1)})
+                b_m, h_m = map(lambda x: float(x)/1000.0, el['size'].split('x'))
+                if el['type'] == 'Beam':
+                    req_ast_bot, req_ast_top, sv_mm, stat = design_beam_is456(el['L'], b_m, h_m, Mu_pos_max, Mu_neg_max, shear, torsion_max, fck, fy)
+                    rebar_bot, rebar_top = get_rebar_detail(req_ast_bot, "Beam", b_m*1000), get_rebar_detail(req_ast_top, "Beam", b_m*1000)
                     
-        df_bbs = pd.DataFrame(bbs_records)
+                    # HARDCODED "Status": stat
+                    design_data.append({"ID": f"M{el['id']}", "Type": "Beam", "Flr": el['ni_n']['floor'], "Size": el['size'], "Bot Rebar": rebar_bot, "Top Rebar": rebar_top, "Ties": f"T8@{sv_mm}", "Status": stat})
+                    
+                    for (count, dia) in parse_rebar_string(rebar_bot):
+                        cut_L = el['L'] - 0.05 + (50 * dia/1000.0) 
+                        bbs_records.append({"Element": f"M{el['id']} (B)", "Type": "Bot Span", "Dia": dia, "No": count, "Cut L(m)": round(cut_L, 2), "Wt(kg)": round((dia**2/162.0)*cut_L*count, 2)})
+                    for (count, dia) in parse_rebar_string(rebar_top):
+                        cut_L = el['L'] - 0.05 + (50 * dia/1000.0) 
+                        bbs_records.append({"Element": f"M{el['id']} (B)", "Type": "Top Support", "Dia": dia, "No": count, "Cut L(m)": round(cut_L, 2), "Wt(kg)": round((dia**2/162.0)*cut_L*count, 2)})
+                    
+                    hanger_dia = 10 if b_m <= 0.25 else 12 
+                    hanger_L = el['L'] - 0.05 + (50 * hanger_dia/1000.0)
+                    bbs_records.append({"Element": f"M{el['id']} (B)", "Type": "Hanger", "Dia": hanger_dia, "No": 2, "Cut L(m)": round(hanger_L, 2), "Wt(kg)": round((hanger_dia**2/162.0)*hanger_L*2, 2)})
 
-        # --- 💰 ESTIMATION TAKEOFF ENGINE ---
-        est_records = []
-        for el in elements:
-            if el['type'] == 'Diaphragm': continue
-            flr = el['ni_n']['floor']
-            b_m, h_m = map(lambda x: float(x)/1000.0, el['size'].split('x'))
-            vol = b_m * h_m * el['L']
-            form = 2 * (b_m + h_m) * el['L'] if el['type'] == 'Column' else (b_m + 2 * h_m) * el['L']
-            est_records.append({"Floor": f"Floor {flr}", "Category": "Concrete", "Qty": vol, "Unit": "m³"})
-            est_records.append({"Floor": f"Floor {flr}", "Category": "Formwork", "Qty": form, "Unit": "m²"})
-            
-        tot_area = max((max(x_coords_sorted) - min(x_coords_sorted)), 1.0) * max((max(y_coords_sorted) - min(y_coords_sorted)), 1.0) if x_coords_sorted and y_coords_sorted else 0
-        for flr in range(1, len(floors_df)+1):
-            est_records.append({"Floor": f"Floor {flr}", "Category": "Concrete", "Qty": tot_area * (slab_thick/1000.0), "Unit": "m³"})
-            est_records.append({"Floor": f"Floor {flr}", "Category": "Formwork", "Qty": tot_area, "Unit": "m²"})
-            
-        for f in footing_results:
-            L_f = float(f['Size'].split('x')[0])
-            D_f = f['D(mm)'] / 1000.0
-            est_records.append({"Floor": "Foundation", "Category": "Concrete", "Qty": L_f * L_f * D_f, "Unit": "m³"})
-            est_records.append({"Floor": "Foundation", "Category": "Formwork", "Qty": 4 * L_f * D_f, "Unit": "m²"})
-            est_records.append({"Floor": "Foundation", "Category": "Excavation", "Qty": (L_f + 1.0)**2 * 1.5, "Unit": "m³"})
-            
-        id_to_floor = {row['ID']: f"Floor {row['Flr']}" for row in analysis_data}
-        
-        def clean_loc(element_str):
-            estr = str(element_str)
-            if "Foot" in estr or "Foundation" in estr: return "Foundation"
-            if "Slab F" in estr: 
-                try: return f"Floor {estr.split('Slab F')[1].split()[0]}"
-                except: pass
-            if "M" in estr:
-                m_id = estr.split(" ")[0]
-                return id_to_floor.get(m_id, "Floor 1")
-            return "Other"
-            
-        for index, row in df_bbs.iterrows():
-            est_records.append({"Floor": clean_loc(row['Element']), "Category": "Steel", "Qty": row['Wt(kg)'], "Unit": "kg"})
-            
-        df_est = pd.DataFrame(est_records)
-        df_detailed = df_est.groupby(['Floor', 'Category', 'Unit'])['Qty'].sum().reset_index()
-        
-        rates_mat = {"Concrete": rate_conc_mat, "Steel": rate_steel_mat, "Formwork": rate_form_mat, "Excavation": 0}
-        rates_lab = {"Concrete": rate_conc_lab, "Steel": rate_steel_lab, "Formwork": rate_form_lab, "Excavation": rate_excavation}
-        
-        df_detailed['Mat. Rate (₹)'] = df_detailed['Category'].map(rates_mat)
-        df_detailed['Lab. Rate (₹)'] = df_detailed['Category'].map(rates_lab)
-        df_detailed['Material Cost (₹)'] = np.round(df_detailed['Qty'] * df_detailed['Mat. Rate (₹)'], 2)
-        df_detailed['Labor Cost (₹)'] = np.round(df_detailed['Qty'] * df_detailed['Lab. Rate (₹)'], 2)
-        df_detailed['Total Cost (₹)'] = df_detailed['Material Cost (₹)'] + df_detailed['Labor Cost (₹)']
-        df_detailed['Qty'] = np.round(df_detailed['Qty'], 2)
+                else:
+                    req_ast, sv_mm, stat = design_column_is456(b_m, h_m, axial, max(Mu_neg_max, Mu_pos_max), shear, torsion_max, fck, fy)
+                    rebar_str = get_rebar_detail(req_ast, "Column", b_m*1000)
+                    
+                    # HARDCODED "Status": stat
+                    design_data.append({"ID": f"M{el['id']}", "Type": "Column", "Flr": el['ni_n']['floor'], "Size": el['size'], "Bot Rebar": "-", "Top Rebar": rebar_str, "Ties": f"T8@{sv_mm}", "Status": stat})
+                    for (count, dia) in parse_rebar_string(rebar_str):
+                        cut_L = el['L'] + (50 * dia/1000.0) 
+                        bbs_records.append({"Element": f"M{el['id']} (C)", "Type": "Main Vert", "Dia": dia, "No": count, "Cut L(m)": round(cut_L, 2), "Wt(kg)": round((dia**2/162.0)*cut_L*count, 2)})
 
-        # --- GENERATE PDF REPORT ---
-        pdf = PDFReport()
-        pdf.add_page()
-        pdf.chapter_title("1. BEAM & COLUMN DETAILING")
-        pdf.build_table(pd.DataFrame(design_data))
-        pdf.chapter_title("2. FOUNDATION SIZING (PUNCHING SHEAR SAFE)")
-        pdf.build_table(pd.DataFrame(footing_results))
-        pdf.chapter_title("3. MONOLITHIC TWO-WAY SLAB (IS 456 Annex D)")
-        slab_data = [{"Panel": f"{round(Lx,2)}m x {round(Ly,2)}m", "Thickness": f"{slab_thick} mm", "Bot Span Mesh": f"T10 @ {int(spc_pos)} c/c", "Top Hogging": f"T10 @ {int(spc_neg)} c/c", "Corner Torsion": f"T10 @ {int(spc_tor)} c/c"}]
-        pdf.build_table(pd.DataFrame(slab_data))
-        pdf.chapter_title("4. BAR BENDING SCHEDULE (BBS)")
-        pdf.build_table(df_bbs)
-        pdf.set_font('Arial', 'B', 12)
-        total_wt_kg = df_bbs["Wt(kg)"].sum()
-        pdf.cell(0, 10, f'TOTAL STEEL TONNAGE REQUIRED: {total_wt_kg / 1000.0:.2f} Metric Tons', 0, 1, 'R')
-        pdf_bytes = pdf.output(dest='S').encode('latin-1')
+                s_cut = 2*(b_m - 0.05 + h_m - 0.05) + (24 * 0.008) if el['type'] == 'Beam' else 2*(b_m - 0.08 + h_m - 0.08) + (24 * 0.008)
+                n_st = int(el['L'] / (sv_mm / 1000.0)) + 1
+                bbs_records.append({"Element": f"M{el['id']}", "Type": "Tie/Stirrup", "Dia": 8, "No": n_st, "Cut L(m)": round(s_cut, 2), "Wt(kg)": round((8**2/162.0)*s_cut*n_st, 2)})
 
-        # --- GENERATE DXF (LibreCAD/AutoCAD WITH DETAILED SP-34 REBAR) ---
-        doc = ezdxf.new('R2010')
-        msp = doc.modelspace()
-        doc.layers.add('GRIDS', color=8, linetype='DASHED')
-        doc.layers.add('CONCRETE_OUTLINE', color=2)
-        doc.layers.add('REBAR_MAIN', color=1)
-        doc.layers.add('REBAR_TIES', color=3)
-        doc.layers.add('DIMENSIONS', color=6)
-        doc.layers.add('ANNOTATIONS', color=7)
+            # --- SLAB CHECK & FOOTING DESIGN ---
+            x_spans = [x_coords_sorted[i+1] - x_coords_sorted[i] for i in range(len(x_coords_sorted)-1) if (x_coords_sorted[i+1] - x_coords_sorted[i]) > 0.1]
+            y_spans = [y_coords_sorted[i+1] - y_coords_sorted[i] for i in range(len(y_coords_sorted)-1) if (y_coords_sorted[i+1] - y_coords_sorted[i]) > 0.1]
+            Lx, Ly = max(min(x_spans) if x_spans else 1.0, 0.001), max(max(y_spans) if y_spans else 1.0, 0.001)
+            ratio = Ly / Lx
+            alpha_pos = np.interp(ratio, [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0], [0.032, 0.037, 0.043, 0.047, 0.051, 0.053, 0.060, 0.065]) if ratio <= 2.0 else 0.125
+            alpha_neg = np.interp(ratio, [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0], [0.043, 0.048, 0.057, 0.064, 0.068, 0.072, 0.080, 0.087]) if ratio <= 2.0 else 0.125
+            w_u_slab = 1.5 * (live_load + floor_finish + (slab_thick/1000.0)*25.0)
+            Mu_pos, Mu_neg = alpha_pos * w_u_slab * (Lx**2), alpha_neg * w_u_slab * (Lx**2)
+            d_eff_slab = max(slab_thick - 25, 1.0)
+            spc_pos = min(math.floor(1000 / (max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_pos*1e6)/(max(fck,1.0)*1000*d_eff_slab**2),0)))*1000*d_eff_slab, 0.0012*1000*slab_thick) / 78.5) / 10)*10, 300) 
+            spc_neg = min(math.floor(1000 / (max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_neg*1e6)/(max(fck,1.0)*1000*d_eff_slab**2),0)))*1000*d_eff_slab, 0.0012*1000*slab_thick) / 78.5) / 10)*10, 300) 
+            spc_tor = min(math.floor(1000 / (0.75 * max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_pos*1e6)/(max(fck,1.0)*1000*d_eff_slab**2),0)))*1000*d_eff_slab, 0.0012*1000*slab_thick) / 78.5) / 10)*10, 300)
+            
+            d_req_flex = math.sqrt((max(Mu_pos, Mu_neg) * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * 1000))
+            d_req_def = (Lx * 1000) / 28.0 
+            safe_slab = slab_thick >= max(d_req_flex, d_req_def) + 25
 
-        def add_dim(p1, p2, offset, text, is_vert=False):
-            if not is_vert:
-                msp.add_line((p1[0], p1[1]), (p1[0], p1[1]+offset), dxfattribs={'layer': 'DIMENSIONS'})
-                msp.add_line((p2[0], p2[1]), (p2[0], p2[1]+offset), dxfattribs={'layer': 'DIMENSIONS'})
-                dy = p1[1]+offset - (0.2 if offset>0 else -0.2)
-                msp.add_line((p1[0], dy), (p2[0], dy), dxfattribs={'layer': 'DIMENSIONS'})
-                msp.add_text(text, dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement(((p1[0]+p2[0])/2 - len(text)*0.04, dy+0.05))
-            else:
-                msp.add_line((p1[0], p1[1]), (p1[0]+offset, p1[1]), dxfattribs={'layer': 'DIMENSIONS'})
-                msp.add_line((p2[0], p2[1]), (p2[0]+offset, p2[1]), dxfattribs={'layer': 'DIMENSIONS'})
-                dx = p1[0]+offset - (0.2 if offset>0 else -0.2)
-                msp.add_line((dx, p1[1]), (dx, p2[1]), dxfattribs={'layer': 'DIMENSIONS'})
-                msp.add_text(text, dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((dx+0.05, (p1[1]+p2[1])/2 - 0.06))
+            for flr in range(1, len(floors_df)+1):
+                n_main, l_main = int(Ly / (spc_pos/1000.0)) + 1, Lx + 1.0
+                n_dist, l_dist = int(Lx / 0.20) + 1, Ly + 1.0
+                bbs_records.append({"Element": f"Slab F{flr}", "Type": "Bot Main", "Dia": 10, "No": n_main, "Cut L(m)": round(l_main,2), "Wt(kg)": round((10**2/162.0)*l_main*n_main,2)})
+                bbs_records.append({"Element": f"Slab F{flr}", "Type": "Bot Dist", "Dia": 10, "No": n_dist, "Cut L(m)": round(l_dist,2), "Wt(kg)": round((10**2/162.0)*l_dist*n_dist,2)})
+                n_top, l_top = int(Ly / (spc_neg/1000.0)) + 1, 0.6 * Lx
+                bbs_records.append({"Element": f"Slab F{flr}", "Type": "Top Supp", "Dia": 10, "No": n_top*2, "Cut L(m)": round(l_top,2), "Wt(kg)": round((10**2/162.0)*l_top*(n_top*2),2)})
+                n_tor = int((Lx/5.0) / (spc_tor/1000.0)) * 2 
+                bbs_records.append({"Element": f"Slab F{flr}", "Type": "Corner Tor", "Dia": 10, "No": n_tor*4, "Cut L(m)": round(Lx/5.0,2), "Wt(kg)": round((10**2/162.0)*(Lx/5.0)*(n_tor*4),2)})
 
-        max_x = max(x_coords_sorted) if x_coords_sorted else 10
-        max_y = max(y_coords_sorted) if y_coords_sorted else 10
-        offset_x = max_x + 5.0 
-        
-        # 1. Floor Framing Plans
-        for idx, row in floors_df.iterrows():
-            f_num = int(row['Floor'])
-            bx = idx * offset_x 
-            msp.add_text(f"FLOOR {f_num} STRUCTURAL FRAMING PLAN", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.4}).set_placement((bx, max_y + 2.0))
-            for _, gx in x_grids_df.iterrows():
-                x = bx + float(gx['X_Coord (m)'])
-                msp.add_line((x, -1.5), (x, max_y + 1.5), dxfattribs={'layer': 'GRIDS'})
-                msp.add_circle((x, max_y + 1.9), radius=0.4, dxfattribs={'layer': 'GRIDS'})
-                msp.add_text(str(gx['Grid_ID']), dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.3}).set_placement((x - 0.12, max_y + 1.75))
-            for _, gy in y_grids_df.iterrows():
-                y = float(gy['Y_Coord (m)'])
-                msp.add_line((bx - 1.5, y), (bx + max_x + 1.5, y), dxfattribs={'layer': 'GRIDS'})
-                msp.add_circle((bx - 1.9, y), radius=0.4, dxfattribs={'layer': 'GRIDS'})
-                msp.add_text(str(gy['Grid_ID']), dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.3}).set_placement((bx - 2.05, y - 0.12))
+            footing_geoms, footing_results = {}, []
+            for nid, data in base_reactions.items():
+                P_service = data['Pu'] / 1.5
+                Side_L = max(math.ceil(math.sqrt((P_service * 1.1) / max(sbc, 1.0)) * 10) / 10.0, 1.0)
+                footing_geoms[nid] = {'x': data['x'], 'y': data['y'], 'L': Side_L}
+                col_b, col_h = map(lambda x: float(x)/1000.0, data['Col_Size'].split('x'))
+                net_upward = data['Pu'] / (Side_L**2)
+                Mu_footing = net_upward * Side_L * (max((Side_L - max(col_b, col_h)) / 2.0, 0.01)**2) / 2.0
+                d_req_flex = math.sqrt((Mu_footing * 1e6) / ((0.133 if fy>=500 else 0.138) * max(fck, 1.0) * (Side_L*1000)))
+                D_prov = max(300, math.ceil((d_req_flex + 50) / 50.0) * 50)
+                d_eff = D_prov - 50 
+                while True:
+                    d_m = d_eff / 1000.0
+                    V_punch = max(data['Pu'] - (net_upward * (col_b + d_m) * (col_h + d_m)), 0)
+                    if (V_punch * 1000) / (2 * ((col_b + d_m) + (col_h + d_m)) * 1000 * d_eff) <= min(0.5 + (min(col_b, col_h) / max(col_b, col_h)), 1.0) * 0.25 * math.sqrt(max(fck, 1.0)): break
+                    D_prov += 50; d_eff = D_prov - 50
+                ftg_spacing = min(math.floor(1000 / (max((0.5*fck/max(fy,1.0))*(1-math.sqrt(max(1-(4.6*Mu_footing*1e6)/(max(fck,1.0)*(Side_L*1000)*d_eff**2),0)))*(Side_L*1000)*d_eff, 0.0012*(Side_L*1000)*D_prov) / Side_L / 113.1) / 10)*10, 300)
+                footing_results.append({"Node": f"N{nid}", "P(kN)": round(data['Pu'], 1), "Size": f"{Side_L}x{Side_L}", "D(mm)": int(D_prov), "Mesh": f"T12@{int(ftg_spacing)}"})
+                num_ftg, l_ftg = int((Side_L - 0.1) / (ftg_spacing/1000.0)) + 1, (Side_L - 0.1) + 2*(D_prov/1000.0 - 0.1)
+                bbs_records.append({"Element": f"Foot N{nid}", "Type": "Base Mesh", "Dia": 12, "No": num_ftg*2, "Cut L(m)": round(l_ftg,2), "Wt(kg)": round((12**2/162.0)*l_ftg*(num_ftg*2),2)})
+
+            clashes, processed = [], set()
+            node_ids = list(footing_geoms.keys())
+            for i in range(len(node_ids)):
+                for j in range(i+1, len(node_ids)):
+                    n1, n2 = node_ids[i], node_ids[j]
+                    if n1 in processed or n2 in processed: continue
+                    f1, f2 = footing_geoms[n1], footing_geoms[n2]
+                    dist = math.hypot(f1['x'] - f2['x'], f1['y'] - f2['y'])
+                    if dist < (f1['L'] / 2.0) + (f2['L'] / 2.0):
+                        clashes.append((n1, n2)); processed.add(n1); processed.add(n2)
+                        
+            df_bbs = pd.DataFrame(bbs_records)
+
+            # --- 💰 ESTIMATION TAKEOFF ENGINE ---
+            est_records = []
+            for el in elements:
+                if el['type'] == 'Diaphragm': continue
+                flr = el['ni_n']['floor']
+                b_m, h_m = map(lambda x: float(x)/1000.0, el['size'].split('x'))
+                vol = b_m * h_m * el['L']
+                form = 2 * (b_m + h_m) * el['L'] if el['type'] == 'Column' else (b_m + 2 * h_m) * el['L']
+                est_records.append({"Floor": f"Floor {flr}", "Category": "Concrete", "Qty": vol, "Unit": "m³"})
+                est_records.append({"Floor": f"Floor {flr}", "Category": "Formwork", "Qty": form, "Unit": "m²"})
                 
-            col_b_m, col_h_m = map(lambda val: float(val)/1000.0, col_size.split('x'))
-            f_cols = [el for el in elements if el['type'] == 'Column' and el['nj_n']['floor'] == f_num]
-            for col in f_cols:
-                cx, cy = bx + col['nj_n']['x'], col['nj_n']['y']
-                msp.add_lwpolyline([(cx - col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy - col_h_m/2)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            tot_area = max((max(x_coords_sorted) - min(x_coords_sorted)), 1.0) * max((max(y_coords_sorted) - min(y_coords_sorted)), 1.0) if x_coords_sorted and y_coords_sorted else 0
+            for flr in range(1, len(floors_df)+1):
+                est_records.append({"Floor": f"Floor {flr}", "Category": "Concrete", "Qty": tot_area * (slab_thick/1000.0), "Unit": "m³"})
+                est_records.append({"Floor": f"Floor {flr}", "Category": "Formwork", "Qty": tot_area, "Unit": "m²"})
                 
-            beam_b_m, beam_h_m = map(lambda val: float(val)/1000.0, beam_size.split('x'))
-            f_beams = [el for el in elements if el['type'] == 'Beam' and el['ni_n']['floor'] == f_num]
-            for beam in f_beams:
-                nx1, ny1 = bx + beam['ni_n']['x'], beam['ni_n']['y']
-                nx2, ny2 = bx + beam['nj_n']['x'], beam['nj_n']['y']
-                if abs(ny1 - ny2) < 0.01:
-                    msp.add_line((nx1, ny1 + beam_b_m/2), (nx2, ny2 + beam_b_m/2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-                    msp.add_line((nx1, ny1 - beam_b_m/2), (nx2, ny2 - beam_b_m/2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-                else: 
-                    msp.add_line((nx1 + beam_b_m/2, ny1), (nx2 + beam_b_m/2, ny2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-                    msp.add_line((nx1 - beam_b_m/2, ny1), (nx2 - beam_b_m/2, ny2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-
-        # 2. Detailed Reinforcement Sections
-        det_x = len(floors_df) * offset_x + 2.0
-        msp.add_text("TYPICAL DETAILED REINFORCEMENT SECTIONS (IS 456 / SP 34)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.5}).set_placement((det_x, max_y + 2.0))
-        
-        # 2A. Column Details (L-Sec and C/S)
-        col_list = [d for d in design_data if d['Type'] == 'Column']
-        if col_list:
-            c_det = col_list[0] 
-            cb, ch = map(lambda x: float(x)/1000.0, c_det['Size'].split('x'))
-            cx, cy = det_x, max_y - 1.0
-            
-            # Column L-Sec
-            msp.add_lwpolyline([(cx, cy), (cx+cb, cy), (cx+cb, cy-3.0), (cx, cy-3.0), (cx, cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            msp.add_line((cx-0.3, cy), (cx+cb+0.3, cy), dxfattribs={'layer': 'GRIDS'}) 
-            msp.add_line((cx-0.3, cy-3.0), (cx+cb+0.3, cy-3.0), dxfattribs={'layer': 'GRIDS'}) 
-            msp.add_line((cx+0.04, cy+0.5), (cx+0.04, cy-3.0-0.5), dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_line((cx+cb-0.04, cy+0.5), (cx+cb-0.04, cy-3.0-0.5), dxfattribs={'layer': 'REBAR_MAIN'})
-            # Splice
-            msp.add_line((cx+0.06, cy-3.0), (cx+0.06, cy-3.0+0.6), dxfattribs={'layer': 'REBAR_MAIN'})
-            sv_m = float(c_det['Ties'].split('@')[1].replace('c/c','').strip()) / 1000.0
-            for i in range(int(3.0/sv_m)): msp.add_line((cx+0.04, cy-3.0+(i*sv_m)), (cx+cb-0.04, cy-3.0+(i*sv_m)), dxfattribs={'layer': 'REBAR_TIES'})
-            add_dim((cx-0.3, cy-3.0), (cx-0.3, cy), -0.5, "Floor Ht 3.0m", True)
-            add_dim((cx, cy+0.2), (cx+cb, cy+0.2), 0.4, f"w={int(cb*1000)}")
-            msp.add_text("COLUMN L-SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 3.8))
-            
-            # Column C/S
-            cs_x = cx + cb + 1.5
-            msp.add_lwpolyline([(cs_x,cy-1.0), (cs_x+cb,cy-1.0), (cs_x+cb,cy-1.0-ch), (cs_x,cy-1.0-ch), (cs_x,cy-1.0)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            msp.add_lwpolyline([(cs_x+0.04,cy-1.0-0.04), (cs_x+cb-0.04,cy-1.0-0.04), (cs_x+cb-0.04,cy-1.0-ch+0.04), (cs_x+0.04,cy-1.0-ch+0.04), (cs_x+0.04,cy-1.0-0.04)], dxfattribs={'layer': 'REBAR_TIES'})
-            for px, py in [(cs_x+0.05,cy-1.0-0.05), (cs_x+cb-0.05,cy-1.0-0.05), (cs_x+cb-0.05,cy-1.0-ch+0.05), (cs_x+0.05,cy-1.0-ch+0.05)]:
-                msp.add_circle((px, py), radius=0.015, dxfattribs={'layer': 'REBAR_MAIN'})
-            add_dim((cs_x, cy-1.0+0.1), (cs_x+cb, cy-1.0+0.1), 0.3, f"{int(cb*1000)}")
-            add_dim((cs_x+cb+0.1, cy-1.0-ch), (cs_x+cb+0.1, cy-1.0), 0.3, f"{int(ch*1000)}", True)
-            msp.add_text("COLUMN C/S", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cs_x, cy - 1.0 - ch - 0.4))
-            msp.add_text(f"Main: {c_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cs_x, cy - 1.0 - ch - 0.7))
-            msp.add_text(f"Ties: {c_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cs_x, cy - 1.0 - ch - 0.9))
-
-        # 2B. Beam Details (L-Sec and C/S)
-        bm_list = [d for d in design_data if d['Type'] == 'Beam']
-        if bm_list:
-            b_det = bm_list[0]
-            bb, bh = map(lambda x: float(x)/1000.0, b_det['Size'].split('x'))
-            cx, cy = det_x + 4.5, max_y - 1.0
-            
-            # Beam L-Sec
-            span = 4.0
-            msp.add_lwpolyline([(cx, cy), (cx+span, cy), (cx+span, cy-bh), (cx, cy-bh), (cx, cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            msp.add_line((cx, cy+0.2), (cx, cy-bh-0.5), dxfattribs={'layer': 'GRIDS'}) # Supp 1
-            msp.add_line((cx+span, cy+0.2), (cx+span, cy-bh-0.5), dxfattribs={'layer': 'GRIDS'}) # Supp 2
-            
-            # Bot main
-            msp.add_line((cx+0.05, cy-bh+0.03), (cx+span-0.05, cy-bh+0.03), dxfattribs={'layer': 'REBAR_MAIN'})
-            # Top extra (0.3L)
-            msp.add_line((cx+0.05, cy-0.03), (cx+0.3*span, cy-0.03), dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_line((cx+span-0.3*span, cy-0.03), (cx+span-0.05, cy-0.03), dxfattribs={'layer': 'REBAR_MAIN'})
-            # Hanger
-            msp.add_line((cx+0.3*span, cy-0.03), (cx+span-0.3*span, cy-0.03), dxfattribs={'layer': 'REBAR_TIES'})
-            
-            sv_m = float(b_det['Ties'].split('@')[1].replace('c/c','').strip()) / 1000.0
-            for i in range(int(span/sv_m)): msp.add_line((cx+(i*sv_m), cy-0.03), (cx+(i*sv_m), cy-bh+0.03), dxfattribs={'layer': 'REBAR_TIES'})
-            
-            add_dim((cx, cy+0.1), (cx+span, cy+0.1), 0.4, f"Clear Span L")
-            msp.add_text("BEAM L-SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx+span/2 - 0.8, cy - bh - 0.6))
-            
-            # Beam C/S
-            cs_x = cx + span + 1.0
-            msp.add_lwpolyline([(cs_x,cy), (cs_x+bb,cy), (cs_x+bb,cy-bh), (cs_x,cy-bh), (cs_x,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            msp.add_lwpolyline([(cs_x+0.025,cy-0.025), (cs_x+bb-0.025,cy-0.025), (cs_x+bb-0.025,cy-bh+0.025), (cs_x+0.025,cy-bh+0.025), (cs_x+0.025,cy-0.025)], dxfattribs={'layer': 'REBAR_TIES'})
-            msp.add_circle((cs_x+0.04, cy-bh+0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_circle((cs_x+bb-0.04, cy-bh+0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_circle((cs_x+0.04, cy-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_circle((cs_x+bb-0.04, cy-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
-            
-            add_dim((cs_x, cy+0.1), (cs_x+bb, cy+0.1), 0.3, f"{int(bb*1000)}")
-            add_dim((cs_x+bb+0.1, cy-bh), (cs_x+bb+0.1, cy), 0.3, f"{int(bh*1000)}", True)
-            msp.add_text("BEAM C/S", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cs_x, cy - bh - 0.4))
-            msp.add_text(f"Top: {b_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((cs_x, cy - bh - 0.6))
-            msp.add_text(f"Bot: {b_det['Bot Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((cs_x, cy - bh - 0.8))
-            msp.add_text(f"Stirrups: {b_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((cs_x, cy - bh - 1.0))
-
-        # 2C. Footing Detail (Plan & Elev)
-        if footing_results:
-            f_det = footing_results[0]
-            fl = float(f_det['Size'].split('x')[0])
-            fd = f_det['D(mm)'] / 1000.0
-            cx, cy = det_x, max_y - 7.0
-            
-            # Plan
-            msp.add_lwpolyline([(cx, cy), (cx+fl, cy), (cx+fl, cy-fl), (cx, cy-fl), (cx, cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            msp.add_lwpolyline([(cx+fl/2-0.15, cy-fl/2+0.22), (cx+fl/2+0.15, cy-fl/2+0.22), (cx+fl/2+0.15, cy-fl/2-0.22), (cx+fl/2-0.15, cy-fl/2-0.22), (cx+fl/2-0.15, cy-fl/2+0.22)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            spc = float(f_det['Mesh'].split('@')[1].replace('c/c','').strip()) / 1000.0
-            for i in range(int(fl/spc)):
-                msp.add_line((cx+0.05+(i*spc), cy-0.05), (cx+0.05+(i*spc), cy-fl+0.05), dxfattribs={'layer': 'REBAR_MAIN'})
-                msp.add_line((cx+0.05, cy-0.05-(i*spc)), (cx+fl-0.05, cy-0.05-(i*spc)), dxfattribs={'layer': 'REBAR_MAIN'})
-            add_dim((cx, cy+0.1), (cx+fl, cy+0.1), 0.4, f"{fl}m")
-            add_dim((cx-0.1, cy-fl), (cx-0.1, cy), -0.4, f"{fl}m", True)
-            msp.add_text("FOOTING TOP VIEW (PLAN)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - fl - 0.4))
-            
-            # Elevation
-            ex, ey = cx + fl + 2.0, cy - fl
-            msp.add_lwpolyline([(ex, ey), (ex+fl, ey), (ex+fl, ey+0.15), (ex+fl/2+0.15, ey+fd), (ex+fl/2-0.15, ey+fd), (ex, ey+0.15), (ex, ey)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            msp.add_lwpolyline([(ex+fl/2-0.15, ey+fd), (ex+fl/2-0.15, ey+fd+0.8), (ex+fl/2+0.15, ey+fd+0.8), (ex+fl/2+0.15, ey+fd)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-            msp.add_line((ex+0.05, ey+0.05), (ex+fl-0.05, ey+0.05), dxfattribs={'layer': 'REBAR_MAIN'}) 
-            for i in range(12): msp.add_circle((ex+0.05+i*(fl-0.1)/11, ey+0.065), radius=0.01, dxfattribs={'layer': 'REBAR_MAIN'}) 
-            # Column Starter Bars
-            msp.add_line((ex+fl/2-0.1, ey+fd+0.8), (ex+fl/2-0.1, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_line((ex+fl/2-0.1, ey+0.06), (ex+fl/2-0.3, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'}) 
-            msp.add_line((ex+fl/2+0.1, ey+fd+0.8), (ex+fl/2+0.1, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'})
-            msp.add_line((ex+fl/2+0.1, ey+0.06), (ex+fl/2+0.3, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'}) 
-            
-            add_dim((ex+fl+0.1, ey), (ex+fl+0.1, ey+fd), 0.4, f"D={int(fd*1000)}", True)
-            add_dim((ex, ey-0.1), (ex+fl, ey-0.1), -0.4, f"L={fl}m")
-            msp.add_text("FOOTING SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((ex, ey - 0.8))
-            msp.add_text(f"Bot Biaxial Mesh: {f_det['Mesh']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((ex, ey - 1.1))
-
-        # 2D. Slab Detail (Section)
-        cx, cy = det_x + 9.0, max_y - 7.0
-        sd = slab_thick / 1000.0
-        msp.add_lwpolyline([(cx,cy), (cx+4.0,cy), (cx+4.0,cy+sd), (cx,cy+sd), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
-        msp.add_line((cx+0.02, cy+0.02), (cx+3.98, cy+0.02), dxfattribs={'layer': 'REBAR_MAIN'}) 
-        msp.add_line((cx+0.02, cy+sd-0.02), (cx+1.0, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) 
-        msp.add_line((cx+3.0, cy+sd-0.02), (cx+3.98, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) 
-        add_dim((cx+4.1, cy), (cx+4.1, cy+sd), 0.3, f"{slab_thick}mm", True)
-        msp.add_text(f"SLAB SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.4))
-        msp.add_text(f"Bot Mesh: T10 @ {int(spc_pos)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.6))
-        msp.add_text(f"Top Extra: T10 @ {int(spc_neg)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
-
-        # Save DXF to buffer
-        fd, path = tempfile.mkstemp(suffix=".dxf")
-        os.close(fd)
-        doc.saveas(path)
-        with open(path, "rb") as f: dxf_bytes = f.read()
-        os.remove(path)
-
-        # --- UI DISPLAY ---
-        st.success("✅ Analysis, PDF Reporting, CAD Drafting & Estimation Complete!")
-        col_dl1, col_dl2 = st.columns(2)
-        with col_dl1: st.download_button(label="📄 Download Production PDF Report", data=pdf_bytes, file_name="Structural_Detailing_Report.pdf", mime="application/pdf", type="primary", width="stretch")
-        with col_dl2: st.download_button(label="📥 Download CAD Plan & Details (.dxf)", data=dxf_bytes, file_name="Floor_Framing_Plans.dxf", mime="application/dxf", type="primary", width="stretch")
-            
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Raw Forces", "📐 Main Detailing", "🟦 Slabs & Footings", "🧾 Bar Bending Schedule", "💰 BOQ & Estimate"])
-        
-        with tab1:
-            st.markdown("### Individual Member Internal Forces")
-            st.dataframe(pd.DataFrame(analysis_data), width="stretch")
-            
-        with tab2:
-            st.markdown("### IS 456 Dynamic Shear & Rebar Layout")
-            st.dataframe(pd.DataFrame(design_data), width="stretch")
+            for f in footing_results:
+                L_f = float(f['Size'].split('x')[0])
+                D_f = f['D(mm)'] / 1000.0
+                est_records.append({"Floor": "Foundation", "Category": "Concrete", "Qty": L_f * L_f * D_f, "Unit": "m³"})
+                est_records.append({"Floor": "Foundation", "Category": "Formwork", "Qty": 4 * L_f * D_f, "Unit": "m²"})
+                est_records.append({"Floor": "Foundation", "Category": "Excavation", "Qty": (L_f + 1.0)**2 * 1.5, "Unit": "m³"})
                 
-        with tab3:
-            st.markdown("### IS 456 Restrained Two-Way Slab Check")
-            st.write(f"- **Critical Panel:** {round(Lx,2)}m x {round(Ly,2)}m | **Max Hogging Moment:** {round(Mu_neg, 2)} kN.m")
-            st.write(f"- **Required Thickness:** {round(max(d_req_flex, d_req_def)+25, 1)} mm | **Provided:** {slab_thick} mm")
-            if safe_slab: st.success(f"✅ Slab Safe. \n- **Bot Span Mesh:** T10 @ {int(spc_pos)} c/c\n- **Top Support (Hogging):** T10 @ {int(spc_neg)} c/c\n- **Corner Torsion Mesh:** T10 @ {int(spc_tor)} c/c")
-            else: st.error("❌ Slab Fails Deflection or Flexure. Increase Thickness.")
+            id_to_floor = {row['ID']: f"Floor {row['Flr']}" for row in analysis_data}
             
-            st.divider()
-            st.markdown("### Foundation Validation & Isolated Footings")
-            if not clashes: st.success("✅ Foundation Validation Passed: No overlapping soil pressure bulbs.")
-            else: st.error(f"🚨 {len(clashes)} Clash(es) Detected. Footings physically overlap or interact. Use Combined or Raft Foundation.")
-            st.dataframe(pd.DataFrame(footing_results), width="stretch")
+            def clean_loc(element_str):
+                estr = str(element_str)
+                if "Foot" in estr or "Foundation" in estr: return "Foundation"
+                if "Slab F" in estr: 
+                    try: return f"Floor {estr.split('Slab F')[1].split()[0]}"
+                    except: pass
+                if "M" in estr:
+                    m_id = estr.split(" ")[0]
+                    return id_to_floor.get(m_id, "Floor 1")
+                return "Other"
                 
-        with tab4:
-            st.markdown("### 🧾 Comprehensive Bar Bending Schedule (BBS)")
-            st.dataframe(df_bbs, width="stretch")
-            st.metric(label="Total Steel Tonnage Required", value=f"{total_wt_kg / 1000.0:.2f} Metric Tons")
-            st.download_button(label="⬇️ Download BBS (CSV)", data=df_bbs.to_csv(index=False), file_name="building_bbs.csv", mime="text/csv", width="stretch")
+            for index, row in df_bbs.iterrows():
+                est_records.append({"Floor": clean_loc(row['Element']), "Category": "Steel", "Qty": row['Wt(kg)'], "Unit": "kg"})
+                
+            df_est = pd.DataFrame(est_records)
+            df_detailed = df_est.groupby(['Floor', 'Category', 'Unit'])['Qty'].sum().reset_index()
             
-        with tab5:
-            st.markdown("### 📝 Detailed Floor-wise Bill of Quantities (BOQ)")
-            st.dataframe(df_detailed, width="stretch")
-            st.subheader("Abstract Estimate (Cost Summary)")
-            df_abstract = df_detailed.groupby('Floor')[['Material Cost (₹)', 'Labor Cost (₹)', 'Total Cost (₹)']].sum().reset_index()
-            st.dataframe(df_abstract, width="stretch")
-            st.metric(label="Grand Total Construction Cost (Estimate)", value=f"₹ {df_abstract['Total Cost (₹)'].sum():,.2f}")
-            st.download_button(label="⬇️ Download Detailed Estimate (CSV)", data=df_detailed.to_csv(index=False), file_name="Detailed_Estimate.csv", mime="text/csv", width="stretch")
+            rates_mat = {"Concrete": rate_conc_mat, "Steel": rate_steel_mat, "Formwork": rate_form_mat, "Excavation": 0}
+            rates_lab = {"Concrete": rate_conc_lab, "Steel": rate_steel_lab, "Formwork": rate_form_lab, "Excavation": rate_excavation}
+            
+            df_detailed['Mat. Rate (₹)'] = df_detailed['Category'].map(rates_mat)
+            df_detailed['Lab. Rate (₹)'] = df_detailed['Category'].map(rates_lab)
+            df_detailed['Material Cost (₹)'] = np.round(df_detailed['Qty'] * df_detailed['Mat. Rate (₹)'], 2)
+            df_detailed['Labor Cost (₹)'] = np.round(df_detailed['Qty'] * df_detailed['Lab. Rate (₹)'], 2)
+            df_detailed['Total Cost (₹)'] = df_detailed['Material Cost (₹)'] + df_detailed['Labor Cost (₹)']
+            df_detailed['Qty'] = np.round(df_detailed['Qty'], 2)
+
+            # --- GENERATE PDF REPORT ---
+            pdf = PDFReport()
+            pdf.add_page()
+            pdf.chapter_title("1. BEAM & COLUMN DETAILING")
+            pdf.build_table(pd.DataFrame(design_data))
+            pdf.chapter_title("2. FOUNDATION SIZING (PUNCHING SHEAR SAFE)")
+            pdf.build_table(pd.DataFrame(footing_results))
+            pdf.chapter_title("3. MONOLITHIC TWO-WAY SLAB (IS 456 Annex D)")
+            slab_data = [{"Panel": f"{round(Lx,2)}m x {round(Ly,2)}m", "Thickness": f"{slab_thick} mm", "Bot Span Mesh": f"T10 @ {int(spc_pos)} c/c", "Top Hogging": f"T10 @ {int(spc_neg)} c/c", "Corner Torsion": f"T10 @ {int(spc_tor)} c/c"}]
+            pdf.build_table(pd.DataFrame(slab_data))
+            pdf.chapter_title("4. BAR BENDING SCHEDULE (BBS)")
+            pdf.build_table(df_bbs)
+            pdf.set_font('Arial', 'B', 12)
+            total_wt_kg = df_bbs["Wt(kg)"].sum()
+            pdf.cell(0, 10, f'TOTAL STEEL TONNAGE REQUIRED: {total_wt_kg / 1000.0:.2f} Metric Tons', 0, 1, 'R')
+            pdf_bytes = pdf.output(dest='S').encode('latin-1')
+
+            # --- GENERATE DXF (LibreCAD/AutoCAD WITH DETAILED SP-34 REBAR) ---
+            doc = ezdxf.new('R2010')
+            msp = doc.modelspace()
+            doc.layers.add('GRIDS', color=8, linetype='DASHED')
+            doc.layers.add('CONCRETE_OUTLINE', color=2)
+            doc.layers.add('REBAR_MAIN', color=1)
+            doc.layers.add('REBAR_TIES', color=3)
+            doc.layers.add('DIMENSIONS', color=6)
+            doc.layers.add('ANNOTATIONS', color=7)
+
+            def add_dim(p1, p2, offset, text, is_vert=False):
+                if not is_vert:
+                    msp.add_line((p1[0], p1[1]), (p1[0], p1[1]+offset), dxfattribs={'layer': 'DIMENSIONS'})
+                    msp.add_line((p2[0], p2[1]), (p2[0], p2[1]+offset), dxfattribs={'layer': 'DIMENSIONS'})
+                    dy = p1[1]+offset - (0.2 if offset>0 else -0.2)
+                    msp.add_line((p1[0], dy), (p2[0], dy), dxfattribs={'layer': 'DIMENSIONS'})
+                    msp.add_text(text, dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement(((p1[0]+p2[0])/2 - len(text)*0.04, dy+0.05))
+                else:
+                    msp.add_line((p1[0], p1[1]), (p1[0]+offset, p1[1]), dxfattribs={'layer': 'DIMENSIONS'})
+                    msp.add_line((p2[0], p2[1]), (p2[0]+offset, p2[1]), dxfattribs={'layer': 'DIMENSIONS'})
+                    dx = p1[0]+offset - (0.2 if offset>0 else -0.2)
+                    msp.add_line((dx, p1[1]), (dx, p2[1]), dxfattribs={'layer': 'DIMENSIONS'})
+                    msp.add_text(text, dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((dx+0.05, (p1[1]+p2[1])/2 - 0.06))
+
+            max_x = max(x_coords_sorted) if x_coords_sorted else 10
+            max_y = max(y_coords_sorted) if y_coords_sorted else 10
+            offset_x = max_x + 5.0 
+            
+            # 1. Floor Framing Plans
+            for idx, row in floors_df.iterrows():
+                f_num = int(row['Floor'])
+                bx = idx * offset_x 
+                msp.add_text(f"FLOOR {f_num} STRUCTURAL FRAMING PLAN", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.4}).set_placement((bx, max_y + 2.0))
+                for _, gx in x_grids_df.iterrows():
+                    x = bx + float(gx['X_Coord (m)'])
+                    msp.add_line((x, -1.5), (x, max_y + 1.5), dxfattribs={'layer': 'GRIDS'})
+                    msp.add_circle((x, max_y + 1.9), radius=0.4, dxfattribs={'layer': 'GRIDS'})
+                    msp.add_text(str(gx['Grid_ID']), dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.3}).set_placement((x - 0.12, max_y + 1.75))
+                for _, gy in y_grids_df.iterrows():
+                    y = float(gy['Y_Coord (m)'])
+                    msp.add_line((bx - 1.5, y), (bx + max_x + 1.5, y), dxfattribs={'layer': 'GRIDS'})
+                    msp.add_circle((bx - 1.9, y), radius=0.4, dxfattribs={'layer': 'GRIDS'})
+                    msp.add_text(str(gy['Grid_ID']), dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.3}).set_placement((bx - 2.05, y - 0.12))
+                    
+                col_b_m, col_h_m = map(lambda val: float(val)/1000.0, col_size.split('x'))
+                f_cols = [el for el in elements if el['type'] == 'Column' and el['nj_n']['floor'] == f_num]
+                for col in f_cols:
+                    cx, cy = bx + col['nj_n']['x'], col['nj_n']['y']
+                    msp.add_lwpolyline([(cx - col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy - col_h_m/2), (cx + col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy + col_h_m/2), (cx - col_b_m/2, cy - col_h_m/2)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                    
+                beam_b_m, beam_h_m = map(lambda val: float(val)/1000.0, beam_size.split('x'))
+                f_beams = [el for el in elements if el['type'] == 'Beam' and el['ni_n']['floor'] == f_num]
+                for beam in f_beams:
+                    nx1, ny1 = bx + beam['ni_n']['x'], beam['ni_n']['y']
+                    nx2, ny2 = bx + beam['nj_n']['x'], beam['nj_n']['y']
+                    if abs(ny1 - ny2) < 0.01:
+                        msp.add_line((nx1, ny1 + beam_b_m/2), (nx2, ny2 + beam_b_m/2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                        msp.add_line((nx1, ny1 - beam_b_m/2), (nx2, ny2 - beam_b_m/2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                    else: 
+                        msp.add_line((nx1 + beam_b_m/2, ny1), (nx2 + beam_b_m/2, ny2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                        msp.add_line((nx1 - beam_b_m/2, ny1), (nx2 - beam_b_m/2, ny2), dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+
+            # 2. Detailed Reinforcement Sections
+            det_x = len(floors_df) * offset_x + 2.0
+            msp.add_text("TYPICAL DETAILED REINFORCEMENT SECTIONS (IS 456 / SP 34)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.5}).set_placement((det_x, max_y + 2.0))
+            
+            # 2A. Column Details (L-Sec and C/S)
+            col_list = [d for d in design_data if d['Type'] == 'Column']
+            if col_list:
+                c_det = col_list[0] 
+                cb, ch = map(lambda x: float(x)/1000.0, c_det['Size'].split('x'))
+                cx, cy = det_x, max_y - 1.0
+                
+                # Column L-Sec
+                msp.add_lwpolyline([(cx, cy), (cx+cb, cy), (cx+cb, cy-3.0), (cx, cy-3.0), (cx, cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                msp.add_line((cx-0.3, cy), (cx+cb+0.3, cy), dxfattribs={'layer': 'GRIDS'}) 
+                msp.add_line((cx-0.3, cy-3.0), (cx+cb+0.3, cy-3.0), dxfattribs={'layer': 'GRIDS'}) 
+                msp.add_line((cx+0.04, cy+0.5), (cx+0.04, cy-3.0-0.5), dxfattribs={'layer': 'REBAR_MAIN'})
+                msp.add_line((cx+cb-0.04, cy+0.5), (cx+cb-0.04, cy-3.0-0.5), dxfattribs={'layer': 'REBAR_MAIN'})
+                # Splice
+                msp.add_line((cx+0.06, cy-3.0), (cx+0.06, cy-3.0+0.6), dxfattribs={'layer': 'REBAR_MAIN'})
+                sv_m = float(c_det['Ties'].split('@')[1].replace('c/c','').strip()) / 1000.0
+                for i in range(int(3.0/sv_m)): msp.add_line((cx+0.04, cy-3.0+(i*sv_m)), (cx+cb-0.04, cy-3.0+(i*sv_m)), dxfattribs={'layer': 'REBAR_TIES'})
+                add_dim((cx-0.3, cy-3.0), (cx-0.3, cy), -0.5, "Floor Ht 3.0m", True)
+                add_dim((cx, cy+0.2), (cx+cb, cy+0.2), 0.4, f"w={int(cb*1000)}")
+                msp.add_text("COLUMN L-SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 3.8))
+                
+                # Column C/S
+                cs_x = cx + cb + 1.5
+                msp.add_lwpolyline([(cs_x,cy-1.0), (cs_x+cb,cy-1.0), (cs_x+cb,cy-1.0-ch), (cs_x,cy-1.0-ch), (cs_x,cy-1.0)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                msp.add_lwpolyline([(cs_x+0.04,cy-1.0-0.04), (cs_x+cb-0.04,cy-1.0-0.04), (cs_x+cb-0.04,cy-1.0-ch+0.04), (cs_x+0.04,cy-1.0-ch+0.04), (cs_x+0.04,cy-1.0-0.04)], dxfattribs={'layer': 'REBAR_TIES'})
+                for px, py in [(cs_x+0.05,cy-1.0-0.05), (cs_x+cb-0.05,cy-1.0-0.05), (cs_x+cb-0.05,cy-1.0-ch+0.05), (cs_x+0.05,cy-1.0-ch+0.05)]:
+                    msp.add_circle((px, py), radius=0.015, dxfattribs={'layer': 'REBAR_MAIN'})
+                add_dim((cs_x, cy-1.0+0.1), (cs_x+cb, cy-1.0+0.1), 0.3, f"{int(cb*1000)}")
+                add_dim((cs_x+cb+0.1, cy-1.0-ch), (cs_x+cb+0.1, cy-1.0), 0.3, f"{int(ch*1000)}", True)
+                msp.add_text("COLUMN C/S", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cs_x, cy - 1.0 - ch - 0.4))
+                msp.add_text(f"Main: {c_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cs_x, cy - 1.0 - ch - 0.7))
+                msp.add_text(f"Ties: {c_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cs_x, cy - 1.0 - ch - 0.9))
+
+            # 2B. Beam Details (L-Sec and C/S)
+            bm_list = [d for d in design_data if d['Type'] == 'Beam']
+            if bm_list:
+                b_det = bm_list[0]
+                bb, bh = map(lambda x: float(x)/1000.0, b_det['Size'].split('x'))
+                cx, cy = det_x + 4.5, max_y - 1.0
+                
+                # Beam L-Sec
+                span = 4.0
+                msp.add_lwpolyline([(cx, cy), (cx+span, cy), (cx+span, cy-bh), (cx, cy-bh), (cx, cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                msp.add_line((cx, cy+0.2), (cx, cy-bh-0.5), dxfattribs={'layer': 'GRIDS'}) # Supp 1
+                msp.add_line((cx+span, cy+0.2), (cx+span, cy-bh-0.5), dxfattribs={'layer': 'GRIDS'}) # Supp 2
+                
+                # Bot main
+                msp.add_line((cx+0.05, cy-bh+0.03), (cx+span-0.05, cy-bh+0.03), dxfattribs={'layer': 'REBAR_MAIN'})
+                # Top extra (0.3L)
+                msp.add_line((cx+0.05, cy-0.03), (cx+0.3*span, cy-0.03), dxfattribs={'layer': 'REBAR_MAIN'})
+                msp.add_line((cx+span-0.3*span, cy-0.03), (cx+span-0.05, cy-0.03), dxfattribs={'layer': 'REBAR_MAIN'})
+                # Hanger
+                msp.add_line((cx+0.3*span, cy-0.03), (cx+span-0.3*span, cy-0.03), dxfattribs={'layer': 'REBAR_TIES'})
+                
+                sv_m = float(b_det['Ties'].split('@')[1].replace('c/c','').strip()) / 1000.0
+                for i in range(int(span/sv_m)): msp.add_line((cx+(i*sv_m), cy-0.03), (cx+(i*sv_m), cy-bh+0.03), dxfattribs={'layer': 'REBAR_TIES'})
+                
+                add_dim((cx, cy+0.1), (cx+span, cy+0.1), 0.4, f"Clear Span L")
+                msp.add_text("BEAM L-SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx+span/2 - 0.8, cy - bh - 0.6))
+                
+                # Beam C/S
+                cs_x = cx + span + 1.0
+                msp.add_lwpolyline([(cs_x,cy), (cs_x+bb,cy), (cs_x+bb,cy-bh), (cs_x,cy-bh), (cs_x,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                msp.add_lwpolyline([(cs_x+0.025,cy-0.025), (cs_x+bb-0.025,cy-0.025), (cs_x+bb-0.025,cy-bh+0.025), (cs_x+0.025,cy-bh+0.025), (cs_x+0.025,cy-0.025)], dxfattribs={'layer': 'REBAR_TIES'})
+                msp.add_circle((cs_x+0.04, cy-bh+0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+                msp.add_circle((cs_x+bb-0.04, cy-bh+0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+                msp.add_circle((cs_x+0.04, cy-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+                msp.add_circle((cs_x+bb-0.04, cy-0.04), radius=0.012, dxfattribs={'layer': 'REBAR_MAIN'})
+                
+                add_dim((cs_x, cy+0.1), (cs_x+bb, cy+0.1), 0.3, f"{int(bb*1000)}")
+                add_dim((cs_x+bb+0.1, cy-bh), (cs_x+bb+0.1, cy), 0.3, f"{int(bh*1000)}", True)
+                msp.add_text("BEAM C/S", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cs_x, cy - bh - 0.4))
+                msp.add_text(f"Top: {b_det['Top Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((cs_x, cy - bh - 0.6))
+                msp.add_text(f"Bot: {b_det['Bot Rebar']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((cs_x, cy - bh - 0.8))
+                msp.add_text(f"Stirrups: {b_det['Ties']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.12}).set_placement((cs_x, cy - bh - 1.0))
+
+            # 2C. Footing Detail (Plan & Elev)
+            if footing_results:
+                f_det = footing_results[0]
+                fl = float(f_det['Size'].split('x')[0])
+                fd = f_det['D(mm)'] / 1000.0
+                cx, cy = det_x, max_y - 7.0
+                
+                # Plan
+                msp.add_lwpolyline([(cx, cy), (cx+fl, cy), (cx+fl, cy-fl), (cx, cy-fl), (cx, cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                msp.add_lwpolyline([(cx+fl/2-0.15, cy-fl/2+0.22), (cx+fl/2+0.15, cy-fl/2+0.22), (cx+fl/2+0.15, cy-fl/2-0.22), (cx+fl/2-0.15, cy-fl/2-0.22), (cx+fl/2-0.15, cy-fl/2+0.22)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                spc = float(f_det['Mesh'].split('@')[1].replace('c/c','').strip()) / 1000.0
+                for i in range(int(fl/spc)):
+                    msp.add_line((cx+0.05+(i*spc), cy-0.05), (cx+0.05+(i*spc), cy-fl+0.05), dxfattribs={'layer': 'REBAR_MAIN'})
+                    msp.add_line((cx+0.05, cy-0.05-(i*spc)), (cx+fl-0.05, cy-0.05-(i*spc)), dxfattribs={'layer': 'REBAR_MAIN'})
+                add_dim((cx, cy+0.1), (cx+fl, cy+0.1), 0.4, f"{fl}m")
+                add_dim((cx-0.1, cy-fl), (cx-0.1, cy), -0.4, f"{fl}m", True)
+                msp.add_text("FOOTING TOP VIEW (PLAN)", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - fl - 0.4))
+                
+                # Elevation
+                ex, ey = cx + fl + 2.0, cy - fl
+                msp.add_lwpolyline([(ex, ey), (ex+fl, ey), (ex+fl, ey+0.15), (ex+fl/2+0.15, ey+fd), (ex+fl/2-0.15, ey+fd), (ex, ey+0.15), (ex, ey)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                msp.add_lwpolyline([(ex+fl/2-0.15, ey+fd), (ex+fl/2-0.15, ey+fd+0.8), (ex+fl/2+0.15, ey+fd+0.8), (ex+fl/2+0.15, ey+fd)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+                msp.add_line((ex+0.05, ey+0.05), (ex+fl-0.05, ey+0.05), dxfattribs={'layer': 'REBAR_MAIN'}) 
+                for i in range(12): msp.add_circle((ex+0.05+i*(fl-0.1)/11, ey+0.065), radius=0.01, dxfattribs={'layer': 'REBAR_MAIN'}) 
+                # Column Starter Bars
+                msp.add_line((ex+fl/2-0.1, ey+fd+0.8), (ex+fl/2-0.1, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'})
+                msp.add_line((ex+fl/2-0.1, ey+0.06), (ex+fl/2-0.3, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'}) 
+                msp.add_line((ex+fl/2+0.1, ey+fd+0.8), (ex+fl/2+0.1, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'})
+                msp.add_line((ex+fl/2+0.1, ey+0.06), (ex+fl/2+0.3, ey+0.06), dxfattribs={'layer': 'REBAR_MAIN'}) 
+                
+                add_dim((ex+fl+0.1, ey), (ex+fl+0.1, ey+fd), 0.4, f"D={int(fd*1000)}", True)
+                add_dim((ex, ey-0.1), (ex+fl, ey-0.1), -0.4, f"L={fl}m")
+                msp.add_text("FOOTING SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((ex, ey - 0.8))
+                msp.add_text(f"Bot Biaxial Mesh: {f_det['Mesh']}", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((ex, ey - 1.1))
+
+            # 2D. Slab Detail (Section)
+            cx, cy = det_x + 9.0, max_y - 7.0
+            sd = slab_thick / 1000.0
+            msp.add_lwpolyline([(cx,cy), (cx+4.0,cy), (cx+4.0,cy+sd), (cx,cy+sd), (cx,cy)], dxfattribs={'layer': 'CONCRETE_OUTLINE'})
+            msp.add_line((cx+0.02, cy+0.02), (cx+3.98, cy+0.02), dxfattribs={'layer': 'REBAR_MAIN'}) 
+            msp.add_line((cx+0.02, cy+sd-0.02), (cx+1.0, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) 
+            msp.add_line((cx+3.0, cy+sd-0.02), (cx+3.98, cy+sd-0.02), dxfattribs={'layer': 'REBAR_MAIN'}) 
+            add_dim((cx+4.1, cy), (cx+4.1, cy+sd), 0.3, f"{slab_thick}mm", True)
+            msp.add_text(f"SLAB SECTION", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.2}).set_placement((cx, cy - 0.4))
+            msp.add_text(f"Bot Mesh: T10 @ {int(spc_pos)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.6))
+            msp.add_text(f"Top Extra: T10 @ {int(spc_neg)} c/c", dxfattribs={'layer': 'ANNOTATIONS', 'height': 0.15}).set_placement((cx, cy - 0.8))
+
+            # Save DXF to buffer
+            fd, path = tempfile.mkstemp(suffix=".dxf")
+            os.close(fd)
+            doc.saveas(path)
+            with open(path, "rb") as f: dxf_bytes = f.read()
+            os.remove(path)
+
+            # --- UI DISPLAY ---
+            st.success("✅ Analysis, PDF Reporting, CAD Drafting & Estimation Complete!")
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1: st.download_button(label="📄 Download Production PDF Report", data=pdf_bytes, file_name="Structural_Detailing_Report.pdf", mime="application/pdf", type="primary", width="stretch")
+            with col_dl2: st.download_button(label="📥 Download CAD Plan & Details (.dxf)", data=dxf_bytes, file_name="Floor_Framing_Plans.dxf", mime="application/dxf", type="primary", width="stretch")
+                
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Raw Forces", "📐 Main Detailing", "🟦 Slabs & Footings", "🧾 Bar Bending Schedule", "💰 BOQ & Estimate"])
+            
+            with tab1:
+                st.markdown("### Individual Member Internal Forces")
+                st.dataframe(pd.DataFrame(analysis_data), width="stretch")
+                
+            with tab2:
+                st.markdown("### IS 456 Dynamic Shear & Rebar Layout")
+                st.dataframe(pd.DataFrame(design_data), width="stretch")
+                    
+            with tab3:
+                st.markdown("### IS 456 Restrained Two-Way Slab Check")
+                st.write(f"- **Critical Panel:** {round(Lx,2)}m x {round(Ly,2)}m | **Max Hogging Moment:** {round(Mu_neg, 2)} kN.m")
+                st.write(f"- **Required Thickness:** {round(max(d_req_flex, d_req_def)+25, 1)} mm | **Provided:** {slab_thick} mm")
+                if safe_slab: st.success(f"✅ Slab Safe. \n- **Bot Span Mesh:** T10 @ {int(spc_pos)} c/c\n- **Top Support (Hogging):** T10 @ {int(spc_neg)} c/c\n- **Corner Torsion Mesh:** T10 @ {int(spc_tor)} c/c")
+                else: st.error("❌ Slab Fails Deflection or Flexure. Increase Thickness.")
+                
+                st.divider()
+                st.markdown("### Foundation Validation & Isolated Footings")
+                if not clashes: st.success("✅ Foundation Validation Passed: No overlapping soil pressure bulbs.")
+                else: st.error(f"🚨 {len(clashes)} Clash(es) Detected. Footings physically overlap or interact. Use Combined or Raft Foundation.")
+                st.dataframe(pd.DataFrame(footing_results), width="stretch")
+                    
+            with tab4:
+                st.markdown("### 🧾 Comprehensive Bar Bending Schedule (BBS)")
+                st.dataframe(df_bbs, width="stretch")
+                st.metric(label="Total Steel Tonnage Required", value=f"{total_wt_kg / 1000.0:.2f} Metric Tons")
+                st.download_button(label="⬇️ Download BBS (CSV)", data=df_bbs.to_csv(index=False), file_name="building_bbs.csv", mime="text/csv", width="stretch")
+                
+            with tab5:
+                st.markdown("### 📝 Detailed Floor-wise Bill of Quantities (BOQ)")
+                st.dataframe(df_detailed, width="stretch")
+                st.subheader("Abstract Estimate (Cost Summary)")
+                df_abstract = df_detailed.groupby('Floor')[['Material Cost (₹)', 'Labor Cost (₹)', 'Total Cost (₹)']].sum().reset_index()
+                st.dataframe(df_abstract, width="stretch")
+                st.metric(label="Grand Total Construction Cost (Estimate)", value=f"₹ {df_abstract['Total Cost (₹)'].sum():,.2f}")
+                st.download_button(label="⬇️ Download Detailed Estimate (CSV)", data=df_detailed.to_csv(index=False), file_name="Detailed_Estimate.csv", mime="text/csv", width="stretch")
