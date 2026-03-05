@@ -13,7 +13,7 @@ from ezdxf.enums import TextEntityAlignment
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Practical 3D Frame Analyzer & Designer", layout="wide")
 st.title("🏗️ 3D Frame Analysis & Complete Building Design")
-st.caption("Audited: 3D Viewport | PDF Export | LibreCAD DXF | BBS | Detailed Estimate")
+st.caption("Audited: Hard Stop Validation | DXF Detailing | BBS | Detailed Estimate")
 
 # --- INITIALIZE STATE ---
 if 'grids' not in st.session_state:
@@ -84,7 +84,6 @@ if "1.2" in combo: f_dl, f_ll, f_eq = 1.2, 1.2, 1.2
 elif "0.9" in combo: f_dl, f_ll, f_eq = 0.9, 0.0, 1.5
 elif "1.5 EQ" in combo: f_dl, f_ll, f_eq = 1.5, 0.0, 1.5
 
-# --- NEW: ESTIMATION RATES ---
 st.sidebar.header("7. BOQ & Estimate Rates (₹)")
 with st.sidebar.expander("Modify Rates (Mat. + Lab.)", expanded=False):
     rate_conc_mat = st.number_input("Concrete Material (₹/m³)", value=5500)
@@ -145,18 +144,27 @@ class PDFReport(FPDF):
             self.ln()
         self.ln(5)
 
-# --- REBAR DETAILING ENGINE ---
-def get_rebar_detail(ast_req, member_type="Beam"):
+# --- REBAR DETAILING ENGINE WITH CONGESTION CHECK ---
+def get_rebar_detail(ast_req, member_type="Beam", b_mm=230):
     areas = {10: 78.5, 12: 113.1, 16: 201.0, 20: 314.1, 25: 490.8, 32: 804.2}
     dias = [10, 12, 16, 20, 25, 32]
     configs = []
+    
+    cover = 25 if member_type == "Beam" else 40
+    stirrup_d = 8
+    def check_fit(n_bars, max_d):
+        min_gap = max(max_d, 25)
+        req_width = (2 * cover) + (2 * stirrup_d) + (n_bars * max_d) + ((n_bars - 1) * min_gap)
+        return req_width <= b_mm
+
     if member_type == "Beam":
         for d in [12, 16, 20, 25, 32]:
-            for n in [2, 3, 4, 5, 6]: configs.append((n, d, 0, 0, n*areas[d]))
+            for n in [2, 3, 4, 5, 6]: 
+                if check_fit(n, d): configs.append((n, d, 0, 0, n*areas[d]))
         for i in range(1, len(dias)):
             for n_main in [2, 3, 4]:
                 for n_sec in [1, 2, 3]:
-                    if n_main + n_sec <= 6:
+                    if n_main + n_sec <= 6 and check_fit(n_main + n_sec, max(dias[i], dias[i-1])):
                         configs.append((n_main, dias[i], n_sec, dias[i-1], n_main*areas[dias[i]] + n_sec*areas[dias[i-1]]))
     else: 
         for d in [12, 16, 20, 25, 32]:
@@ -164,15 +172,16 @@ def get_rebar_detail(ast_req, member_type="Beam"):
         for i in range(1, len(dias)):
             for n_face in [2, 4, 6, 8]:
                 configs.append((4, dias[i], n_face, dias[i-1], 4*areas[dias[i]] + n_face*areas[dias[i-1]]))
+                
     configs.sort(key=lambda x: x[4])
     for c in configs:
         if c[4] >= ast_req:
             if c[2] == 0: return f"{c[0]}-T{c[1]} (Prv: {int(c[4])})"
             else: return f"{c[0]}-T{c[1]} + {c[2]}-T{c[3]} (Prv: {int(c[4])})"
-    return "Custom"
+    return "Custom (Resize Section)"
 
 def parse_rebar_string(rebar_str):
-    if "Prv" not in str(rebar_str): return []
+    if "Prv" not in str(rebar_str) or "Resize" in str(rebar_str): return []
     bars = []
     for part in rebar_str.split(" (Prv")[0].split(" + "):
         if "-T" in part:
@@ -194,7 +203,7 @@ def calculate_shear_spacing(Ve_kN, b, d, fck, fy, is_column=False):
     sv_final = max(min(math.floor(sv / 10) * 10, sv_max), 100) 
     return int(sv_final), "Safe"
 
-def design_beam_is456(b_m, h_m, Mu_pos_kNm, Mu_neg_kNm, Vu_kN, Tu_kNm, fck, fy):
+def design_beam_is456(L_m, b_m, h_m, Mu_pos_kNm, Mu_neg_kNm, Vu_kN, Tu_kNm, fck, fy):
     b, h = max(b_m * 1000, 1.0), max(h_m * 1000, 1.0)
     d = max(h - 40, 1.0) 
     Ve_kN = Vu_kN + 1.6 * (Tu_kNm / b_m) if b_m > 0 else Vu_kN
@@ -208,8 +217,16 @@ def design_beam_is456(b_m, h_m, Mu_pos_kNm, Mu_neg_kNm, Vu_kN, Tu_kNm, fck, fy):
         return max(ast, 0.85 * b * d / max(fy, 1.0))
     Ast_bot, Ast_top = calc_ast(Me_pos), calc_ast(Me_neg)
     sv, shear_stat = calculate_shear_spacing(Ve_kN, b, d, fck, fy)
+    
+    status_flags = []
+    if (L_m * 1000) / d > 26: status_flags.append("Deflect Fail")
+    if Ast_bot > 0.04 * b * h or Ast_top > 0.04 * b * h: status_flags.append("Over-Reinf (>4%)")
+    
     if Tu_kNm > 1.0: shear_stat += " (Closed)"
-    return round(Ast_bot, 1), round(Ast_top, 1), sv, shear_stat
+    if "Fail" in shear_stat: status_flags.append("Shear Fail")
+    
+    final_status = "Safe" if not status_flags else " | ".join(status_flags)
+    return round(Ast_bot, 1), round(Ast_top, 1), sv, final_status
 
 def design_column_is456(b_m, h_m, Pu_kN, Mu_kNm, Vu_kN, Tu_kNm, fck, fy):
     b, h = max(b_m * 1000, 1.0), max(h_m * 1000, 1.0)
@@ -219,12 +236,16 @@ def design_column_is456(b_m, h_m, Pu_kN, Mu_kNm, Vu_kN, Tu_kNm, fck, fy):
     Pu, Me = Pu_kN * 1000, Me_kNm * 1e6 
     Asc_axial = (Pu - 0.4 * fck * Ag) / max(0.67 * fy - 0.4 * fck, 1.0) if Pu > 0.4 * fck * Ag else 0
     Asc_req = max(Asc_axial + (Me / max(0.87 * fy * d, 1.0)), 0.008 * Ag)
-    status = "Safe"
-    if Asc_req > 0.040 * Ag: status = "Over-Reinf"
-    if Pu > (0.45 * fck * Ag + 0.75 * fy * (0.04 * Ag)): status = "Crush"
+    
+    status_flags = []
+    if Asc_req > 0.040 * Ag: status_flags.append("Over-Reinf")
+    if Pu > (0.45 * fck * Ag + 0.75 * fy * (0.04 * Ag)): status_flags.append("Crush")
+    
     sv, shear_stat = calculate_shear_spacing(Ve_kN, b, d, fck, fy, is_column=True)
-    if "Fail" in shear_stat: status += " | Shear Fail"
-    return round(Asc_req, 1), sv, status
+    if "Fail" in shear_stat: status_flags.append("Shear Fail")
+    
+    final_status = "Safe" if not status_flags else " | ".join(status_flags)
+    return round(Asc_req, 1), sv, final_status
 
 # --- ENGINE: BUILD MESH ---
 def build_mesh():
@@ -370,6 +391,29 @@ def transform_matrix(ni, nj, angle_deg):
 st.divider()
 
 if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates", type="primary", width="stretch"):
+    
+    # --- 🛑 HARD KILL-SWITCH VALIDATION ---
+    # This physically stops the script from generating "ghost" tables if input is bad
+    def check_size(s_str):
+        try:
+            b, h = map(float, str(s_str).lower().replace(" ", "").split("x"))
+            return b >= 100 and h >= 100
+        except:
+            return False
+            
+    if not check_size(beam_size):
+        st.error(f"🚨 **FATAL ERROR:** Beam size '{beam_size}' is physically impossible. Format must be 'BxD' and dimensions ≥ 100mm.")
+        st.stop()  # KILLS THE APP HERE
+        
+    if not check_size(col_size):
+        st.error(f"🚨 **FATAL ERROR:** Column size '{col_size}' is physically impossible. Format must be 'BxD' and dimensions ≥ 100mm.")
+        st.stop()  # KILLS THE APP HERE
+        
+    if slab_thick < 75:
+        st.error(f"🚨 **FATAL ERROR:** Slab thickness '{slab_thick}mm' violates IS Code minimums (must be ≥ 75mm).")
+        st.stop()  # KILLS THE APP HERE
+
+    # --- ENGINE EXECUTION (ONLY RUNS IF VALIDATION PASSES) ---
     with st.spinner("Solving Matrix, Running Code Checks & Building CAD Files..."):
         ndof = len(nodes) * 6
         K_global = np.zeros((ndof, ndof))
@@ -447,10 +491,13 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates", type="primar
 
             analysis_data.append({"ID": f"M{el['id']}", "Type": el['type'], "Flr": el['ni_n']['floor'], "L(m)": round(el['L'],2), "P(kN)": round(axial,1), "V(kN)": round(shear,1), "M(kN.m)": round(max(Mu_pos_max, Mu_neg_max),1)})
             b_m, h_m = map(lambda x: float(x)/1000.0, el['size'].split('x'))
+            
             if el['type'] == 'Beam':
-                req_ast_bot, req_ast_top, sv_mm, stat = design_beam_is456(b_m, h_m, Mu_pos_max, Mu_neg_max, shear, torsion_max, fck, fy)
-                rebar_bot, rebar_top = get_rebar_detail(req_ast_bot, "Beam"), get_rebar_detail(req_ast_top, "Beam")
-                design_data.append({"ID": f"M{el['id']}", "Type": "Beam", "Flr": el['ni_n']['floor'], "Size": el['size'], "Bot Rebar": rebar_bot, "Top Rebar": rebar_top, "Ties": f"T8@{sv_mm}"})
+                req_ast_bot, req_ast_top, sv_mm, stat = design_beam_is456(el['L'], b_m, h_m, Mu_pos_max, Mu_neg_max, shear, torsion_max, fck, fy)
+                rebar_bot, rebar_top = get_rebar_detail(req_ast_bot, "Beam", b_m*1000), get_rebar_detail(req_ast_top, "Beam", b_m*1000)
+                
+                # STATUS COLUMN EXPLICITLY ADDED HERE
+                design_data.append({"ID": f"M{el['id']}", "Type": "Beam", "Flr": el['ni_n']['floor'], "Size": el['size'], "Bot Rebar": rebar_bot, "Top Rebar": rebar_top, "Ties": f"T8@{sv_mm}", "Status": stat})
                 
                 for (count, dia) in parse_rebar_string(rebar_bot):
                     cut_L = el['L'] - 0.05 + (50 * dia/1000.0) 
@@ -465,8 +512,10 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates", type="primar
 
             else:
                 req_ast, sv_mm, stat = design_column_is456(b_m, h_m, axial, max(Mu_neg_max, Mu_pos_max), shear, torsion_max, fck, fy)
-                rebar_str = get_rebar_detail(req_ast, "Column")
-                design_data.append({"ID": f"M{el['id']}", "Type": "Column", "Flr": el['ni_n']['floor'], "Size": el['size'], "Bot Rebar": "-", "Top Rebar": rebar_str, "Ties": f"T8@{sv_mm}"})
+                rebar_str = get_rebar_detail(req_ast, "Column", b_m*1000)
+                
+                # STATUS COLUMN EXPLICITLY ADDED HERE
+                design_data.append({"ID": f"M{el['id']}", "Type": "Column", "Flr": el['ni_n']['floor'], "Size": el['size'], "Bot Rebar": "-", "Top Rebar": rebar_str, "Ties": f"T8@{sv_mm}", "Status": stat})
                 for (count, dia) in parse_rebar_string(rebar_str):
                     cut_L = el['L'] + (50 * dia/1000.0) 
                     bbs_records.append({"Element": f"M{el['id']} (C)", "Type": "Main Vert", "Dia": dia, "No": count, "Cut L(m)": round(cut_L, 2), "Wt(kg)": round((dia**2/162.0)*cut_L*count, 2)})
@@ -560,7 +609,6 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates", type="primar
             est_records.append({"Floor": "Foundation", "Category": "Formwork", "Qty": 4 * L_f * D_f, "Unit": "m²"})
             est_records.append({"Floor": "Foundation", "Category": "Excavation", "Qty": (L_f + 1.0)**2 * 1.5, "Unit": "m³"})
             
-        # Helper to trace element ID back to floor
         id_to_floor = {row['ID']: f"Floor {row['Flr']}" for row in analysis_data}
         
         def clean_loc(element_str):
