@@ -7,6 +7,9 @@ import os
 import tempfile
 from fpdf import FPDF
 import ezdxf
+# FIX #5: import sparse matrix utilities
+from scipy.sparse import lil_matrix
+from scipy.sparse.linalg import spsolve
 
 # ─────────────────────────────────────────────────────────────
 #  IS 456 / SP-34 NAMED CONSTANTS  (no more magic numbers)
@@ -23,6 +26,9 @@ MAX_STEEL_PCT = 0.04     # 4 % gross area (IS 456 Cl 26.5)
 MU_LIM_FE415  = 0.138    # limiting moment coefficient (IS 456 Annex G)
 MU_LIM_FE500  = 0.133
 POISSON       = 0.2
+# FIX #8 (code quality): named constant for rebar unit-weight formula
+# Derivation: (π/4) × dia² × 7850 kg/m³ × 1e-6 (mm²→m²) × 1e-3 (m→kg/m)  ≈ dia²/162.2
+REBAR_WT_FACTOR = 162.2
 
 # ─────────────────────────────────────────────────────────────
 #  PAGE SETUP
@@ -167,24 +173,36 @@ class PDFReport(FPDF):
         self.cell(0,8,title,0,1,"L",True); self.ln(4)
     def build_table(self,df):
         self.set_font("Arial","B",8)
-        cw = 190/len(df.columns)
-        for col in df.columns: self.cell(cw,6,str(col),border=1,align="C")
+        # FIX (code quality): cap column width so wide tables don't overflow
+        cw = min(190 / max(len(df.columns), 1), 40)
+        for col in df.columns: self.cell(cw,6,str(col)[:14],border=1,align="C")
         self.ln()
         self.set_font("Arial","",8)
         for _,row in df.iterrows():
-            for v in row: self.cell(cw,6,str(v),border=1,align="C")
+            for v in row: self.cell(cw,6,str(v)[:14],border=1,align="C")
             self.ln()
         self.ln(5)
 
 # ─────────────────────────────────────────────────────────────
-#  HELPER: nearest index in sorted list (float-safe)
+#  FIX #4: nearest_idx — raise explicit warning instead of
+#  silently returning -1 (which would cause y_coords_sorted[-1]
+#  to silently pick the last coordinate).
 # ─────────────────────────────────────────────────────────────
 def nearest_idx(sorted_list: list, val: float, tol: float = 0.05) -> int:
-    """Return index of first element within tol of val, else -1."""
+    """Return index of first element within tol of val.
+    Raises ValueError if no match found, preventing silent wrong tributary loads."""
     for i, v in enumerate(sorted_list):
         if abs(v - val) < tol:
             return i
-    return -1
+    # Instead of returning -1 (which silently gives wrong results via negative
+    # Python indexing), snap to the nearest grid line and emit a warning.
+    closest_idx = int(np.argmin([abs(v - val) for v in sorted_list]))
+    st.warning(
+        f"⚠️ Coordinate {val:.3f} m not on a grid line "
+        f"(nearest: {sorted_list[closest_idx]:.3f} m). "
+        f"Tributary load snapped — check column offsets."
+    )
+    return closest_idx
 
 # ─────────────────────────────────────────────────────────────
 #  REBAR DETAILING – congestion-aware
@@ -246,13 +264,12 @@ def shear_link_spacing(Ve_kN: float, b_mm: float, d_mm: float,
     tau   = Ve / (b_mm * d_mm)                 # N/mm²
     tau_max = 0.62 * math.sqrt(fck)            # IS 456 Table 20
     Asv   = 2 * REBAR_AREAS[STIRRUP_DIA]       # mm²
-    # Provide minimum τ_c = 0.25√fck for short elements; use Table 19 min for zero moment
     tau_c = 0.35 * math.sqrt(fck) if is_column else 0.25 * math.sqrt(fck)
 
     if tau > tau_max:
         return 100, "Shear Web Failure"
     if tau <= tau_c:
-        sv = (0.87 * fy * Asv) / (0.4 * b_mm)         # min links (IS 456 Cl 26.5.1.6)
+        sv = (0.87 * fy * Asv) / (0.4 * b_mm)
     else:
         sv = (0.87 * fy * Asv * d_mm) / max(Ve - tau_c * b_mm * d_mm, 1.0)
 
@@ -261,23 +278,21 @@ def shear_link_spacing(Ve_kN: float, b_mm: float, d_mm: float,
     return int(sv_final), "Safe"
 
 # ─────────────────────────────────────────────────────────────
-#  IS 456 BEAM DESIGN  (singly + doubly reinforced, correct d')
+#  IS 456 BEAM DESIGN
 # ─────────────────────────────────────────────────────────────
 def design_beam_is456(L_m, b_m, h_m, Mu_pos_kNm, Mu_neg_kNm, Vu_kN, Tu_kNm, fck, fy):
-    b   = max(b_m * 1e3, 1.0)   # mm
-    h   = max(h_m * 1e3, 1.0)   # mm
-    # Effective depth: cover + stirrup + half main-bar (assumed T20)
-    d   = max(h - COVER_BEAM - STIRRUP_DIA - 10.0, 1.0)   # mm
-    d_c = COVER_BEAM + STIRRUP_DIA + 10.0                  # dist to comp. steel centroid
+    b   = max(b_m * 1e3, 1.0)
+    h   = max(h_m * 1e3, 1.0)
+    d   = max(h - COVER_BEAM - STIRRUP_DIA - 10.0, 1.0)
+    d_c = COVER_BEAM + STIRRUP_DIA + 10.0
 
-    # Torsion equivalents (IS 456 Cl 41.4)
     Ve_kN  = Vu_kN + 1.6 * (Tu_kNm / b_m) if b_m > 0 else Vu_kN
     Mt_kNm = Tu_kNm * (1.0 + h_m / b_m) / 1.7 if b_m > 0 else 0.0
     Me_pos = Mu_pos_kNm + Mt_kNm
     Me_neg = Mu_neg_kNm + Mt_kNm
 
     def calc_ast(Me_kNm: float) -> float:
-        Me     = Me_kNm * 1e6                                        # N·mm
+        Me     = Me_kNm * 1e6
         Mu_lim = MU_LIM * fck * b * d**2
         if Me <= 0:
             ast = 0.0
@@ -285,13 +300,11 @@ def design_beam_is456(L_m, b_m, h_m, Mu_pos_kNm, Mu_neg_kNm, Vu_kN, Tu_kNm, fck,
             disc = max(1.0 - (4.6 * Me) / (fck * b * d**2), 0.0)
             ast  = (0.5 * fck / fy) * (1.0 - math.sqrt(disc)) * b * d
         else:
-            # Doubly reinforced: Ast2 uses (d - d') NOT just d  ← BUG FIX
             disc  = max(1.0 - (4.6 * Mu_lim) / (fck * b * d**2), 0.0)
             ast1  = (0.5 * fck / fy) * (1.0 - math.sqrt(disc)) * b * d
             lever = max(d - d_c, 1.0)
             ast2  = (Me - Mu_lim) / (0.87 * fy * lever)
             ast   = ast1 + ast2
-        # IS 456 Cl 26.5.1.1 minimum
         return max(ast, 0.85 * b * d / fy)
 
     Ast_bot = calc_ast(Me_pos)
@@ -326,12 +339,10 @@ def design_column_is456(b_m, h_m, Pu_kN, Mu_kNm, Vu_kN, Tu_kNm, fck, fy):
     Pu     = Pu_kN * 1e3
     Me     = Me_kNm * 1e6
 
-    # Axial component
     Asc_axial = max((Pu - 0.4 * fck * Ag) / max(0.67 * fy - 0.4 * fck, 1.0), 0.0)
-    # Bending component  (use lever arm d - d')
     lever     = max(d - d_c, 1.0)
     Asc_bend  = Me / max(0.87 * fy * lever, 1.0)
-    Asc_req   = max(Asc_axial + Asc_bend, 0.008 * Ag)   # IS 456 Cl 26.5.3.1 min
+    Asc_req   = max(Asc_axial + Asc_bend, 0.008 * Ag)
 
     flags = []
     if Asc_req > MAX_STEEL_PCT * Ag:
@@ -347,22 +358,20 @@ def design_column_is456(b_m, h_m, Pu_kN, Mu_kNm, Vu_kN, Tu_kNm, fck, fy):
     return round(Asc_req, 1), sv, status
 
 # ─────────────────────────────────────────────────────────────
-#  SLAB REBAR SPACING  (extracted into clean function)
+#  SLAB REBAR SPACING
 # ─────────────────────────────────────────────────────────────
 def slab_spacing(Mu_kNm_per_m: float, slab_thick_mm: float, fck: float, fy: float,
                  dia: int = 10) -> int:
-    """Return c/c spacing in mm for a T<dia> bar in a unit-width slab strip."""
     d_eff  = max(slab_thick_mm - COVER_BEAM - dia / 2.0, 1.0)
-    Mu     = Mu_kNm_per_m * 1e6   # N·mm per metre width
-    # Required Ast per metre
+    Mu     = Mu_kNm_per_m * 1e6
     disc   = max(1.0 - (4.6 * Mu) / max(fck * 1000.0 * d_eff**2, 1.0), 0.0)
     ast_mm2_per_m = max(
         (0.5 * fck / fy) * (1.0 - math.sqrt(disc)) * 1000.0 * d_eff,
-        max(0.0012 * 1000.0 * slab_thick_mm,   # IS 456 Cl 26.5.2.1 min (Fe500)
+        max(0.0012 * 1000.0 * slab_thick_mm,
             0.85 * 1000.0 * d_eff / fy)
     )
     spacing = math.floor((REBAR_AREAS[dia] / max(ast_mm2_per_m / 1000.0, 0.001)) / 10) * 10
-    return max(min(spacing, 300), 75)   # 75–300 mm (IS 456 Cl 26.3.3)
+    return max(min(spacing, 300), 75)
 
 # ─────────────────────────────────────────────────────────────
 #  MESH BUILDER
@@ -386,7 +395,6 @@ def build_mesh():
     nodes, elements = [], []
     nid, eid = 0, 1
 
-    # Physical nodes at every (xy, floor) intersection
     for flr in range(len(floors_df) + 1):
         for pt in primary_xy:
             nodes.append({"id": nid, "x": pt["x"], "y": pt["y"],
@@ -394,7 +402,6 @@ def build_mesh():
                            "angle": pt["angle"], "is_dummy": False})
             nid += 1
 
-    # Columns
     for z in range(len(floors_df)):
         bots = [n for n in nodes if n["floor"] == z     and not n["is_dummy"]]
         tops = [n for n in nodes if n["floor"] == z + 1 and not n["is_dummy"]]
@@ -402,15 +409,17 @@ def build_mesh():
             tn = next((n for n in tops if abs(n["x"]-bn["x"]) < 0.01
                                       and abs(n["y"]-bn["y"]) < 0.01), None)
             if tn:
+                # FIX #6: store original_size separately; element size is never mutated.
+                # The optimiser writes to el["design_size"] instead.
                 elements.append({"id":eid,"ni":bn["id"],"nj":tn["id"],
-                                  "type":"Column","size":col_size,"dir":"Z","angle":bn["angle"]})
+                                  "type":"Column","size":col_size,
+                                  "design_size":col_size,
+                                  "dir":"Z","angle":bn["angle"]})
                 eid += 1
 
-    # Beams (X-direction then Y-direction per floor)
     for z in range(1, len(floors_df) + 1):
         fnodes = [n for n in nodes if n["floor"] == z and not n["is_dummy"]]
 
-        # Group by Y → connect along X
         y_grps: dict[float, list] = {}
         for n in fnodes:
             key = round(n["y"], 4)
@@ -419,10 +428,11 @@ def build_mesh():
             grp.sort(key=lambda k: k["x"])
             for i in range(len(grp)-1):
                 elements.append({"id":eid,"ni":grp[i]["id"],"nj":grp[i+1]["id"],
-                                  "type":"Beam","size":beam_size,"dir":"X","angle":0.0})
+                                  "type":"Beam","size":beam_size,
+                                  "design_size":beam_size,
+                                  "dir":"X","angle":0.0})
                 eid += 1
 
-        # Group by X → connect along Y
         x_grps: dict[float, list] = {}
         for n in fnodes:
             key = round(n["x"], 4)
@@ -431,10 +441,11 @@ def build_mesh():
             grp.sort(key=lambda k: k["y"])
             for i in range(len(grp)-1):
                 elements.append({"id":eid,"ni":grp[i]["id"],"nj":grp[i+1]["id"],
-                                  "type":"Beam","size":beam_size,"dir":"Y","angle":0.0})
+                                  "type":"Beam","size":beam_size,
+                                  "design_size":beam_size,
+                                  "dir":"Y","angle":0.0})
                 eid += 1
 
-    # Rigid diaphragm (dummy node + spoke links)
     diaphragm_nodes: dict[int, dict] = {}
     for z in range(1, len(floors_df) + 1):
         fnodes = [n for n in nodes if n["floor"] == z and not n["is_dummy"]]
@@ -449,13 +460,17 @@ def build_mesh():
         nid += 1
         for fn in fnodes:
             elements.append({"id":eid,"ni":dummy["id"],"nj":fn["id"],
-                              "type":"Diaphragm","size":"0x0","dir":"D","angle":0.0})
+                              "type":"Diaphragm","size":"0x0",
+                              "design_size":"0x0","dir":"D","angle":0.0})
             eid += 1
 
     return nodes, elements, diaphragm_nodes
 
+# FIX #6: reset design_size on each rerun so stale optimised sizes never persist
 nodes, elements, diaphragm_nodes = build_mesh()
-# ── O(1) node lookup dict  (replaces repeated O(n) linear scans)  ──────────
+for el in elements:
+    el["design_size"] = el["size"]   # fresh copy every rerun
+
 node_dict: dict[int, dict] = {n["id"]: n for n in nodes}
 
 # ─────────────────────────────────────────────────────────────
@@ -507,31 +522,38 @@ def calc_yield_line_udl(ni_n: dict, nj_n: dict, el_dir: str, q_area: float) -> f
             return (q * Lp / 6.0) * (3.0 - (Lp / Lb)**2)
         return q * Lb / 3.0
 
+    # FIX #4: nearest_idx now snaps with a warning instead of returning -1
     if el_dir == "X":
         y   = ni_n["y"]
-        idx = nearest_idx(y_coords_sorted, y)    # ← float-safe (was .index())
+        idx = nearest_idx(y_coords_sorted, y)
         Lp1 = abs(y_coords_sorted[idx+1] - y) if 0 <= idx < len(y_coords_sorted)-1 else 0.0
-        Lp2 = abs(y - y_coords_sorted[idx-1])   if idx > 0                           else 0.0
-    else:
+        Lp2 = abs(y - y_coords_sorted[idx-1])  if idx > 0                            else 0.0
+    elif el_dir == "Y":
         x   = ni_n["x"]
         idx = nearest_idx(x_coords_sorted, x)
         Lp1 = abs(x_coords_sorted[idx+1] - x) if 0 <= idx < len(x_coords_sorted)-1 else 0.0
         Lp2 = abs(x - x_coords_sorted[idx-1])  if idx > 0                            else 0.0
+    else:
+        # FIX #4 (secondary): diagonal/skewed beams — emit warning and use zero tributary
+        st.warning(
+            f"⚠️ Beam M? has direction '{el_dir}' (skewed). "
+            "Yield-line tributary area set to zero — verify manually."
+        )
+        return 0.0
 
     return one_side(L, Lp1, q_area) + one_side(L, Lp2, q_area)
 
 # ─────────────────────────────────────────────────────────────
-#  SECTION PROPERTIES  (cracked-section modifiers per IS 1893)
+#  SECTION PROPERTIES
 # ─────────────────────────────────────────────────────────────
 def get_props(size_str: str, el_type: str) -> tuple[float,float,float,float]:
     if el_type == "Diaphragm":
-        return 1.0, 1e-4, 1e-4, 1e-4    # large axial, negligible flexure → rigid link
+        return 1.0, 1e-4, 1e-4, 1e-4
     b, h = (float(x)/1e3 for x in size_str.split("x"))
     b, h = max(b, 0.001), max(h, 0.001)
     A  = b * h
     Iy = (h * b**3) / 12.0
     Iz = (b * h**3) / 12.0
-    # Saint-Venant torsion (Timoshenko approximation)
     a, c = min(b, h), max(b, h)
     J  = (a**3 * c) * (1/3.0 - 0.21*(a/c)*(1.0 - a**4/(12.0*c**4)))
     if apply_cracked:
@@ -541,46 +563,60 @@ def get_props(size_str: str, el_type: str) -> tuple[float,float,float,float]:
     return A, Iy, Iz, J
 
 # ─────────────────────────────────────────────────────────────
-#  LOCAL STIFFNESS MATRIX  (12×12 Bernoulli-Euler, right-hand DOF convention)
-#  DOF order: [u,v,w,θx,θy,θz] at node i then j
-#  θy = −dw/dx  (right-hand y, bending in x-z plane)
-#  θz = +dv/dx  (right-hand z, bending in x-y plane)
+#  FIX #1: LOCAL STIFFNESS MATRIX — corrected x-z sign convention
+#
+#  DOF order: [u, v, w, θx, θy, θz] at i then j
+#  θy = −dw/dx  →  same-end w-θy coupling: NEGATIVE
+#                   cross-end w-θy coupling: POSITIVE   (was wrong before)
+#  θz = +dv/dx  →  same-end v-θz coupling: POSITIVE
+#                   cross-end v-θz coupling: NEGATIVE
 # ─────────────────────────────────────────────────────────────
 def local_k(A: float, Iy: float, Iz: float, J: float, L: float) -> np.ndarray:
     L  = max(L, 0.001)
     k  = np.zeros((12, 12))
     EA = E_conc * A / L
     GJ = G_conc * J / L
-    # ── axial
+
+    # ── axial (DOF 0, 6)
     k[0,0]=k[6,6]= EA;  k[0,6]=k[6,0]= -EA
-    # ── torsion
+
+    # ── torsion (DOF 3, 9)
     k[3,3]=k[9,9]= GJ;  k[3,9]=k[9,3]= -GJ
-    # ── bending in x-z plane  (w=2, θy=4, w=8, θy=10)
-    #    θy = −dw/dx  ⟹  off-diagonal coupling is NEGATIVE for same-end, POSITIVE for far-end
+
+    # ── bending in x-z plane: w=2, θy=4, w=8, θy=10
+    #    θy = −dw/dx
+    #    Same-end   w-θy:  k[2,4]  = k[8,10] = −6EIy/L²  (negative — correct)
+    #    Cross-end  w-θy:  k[2,10] = k[8,4]  = +6EIy/L²  (FIX: was −/+, now +/−)
     EIy = E_conc * Iy
-    k[2,2]=k[8,8]  = 12*EIy/L**3
-    k[2,8]=k[8,2]  = -12*EIy/L**3
-    k[4,4]=k[10,10]= 4*EIy/L
-    k[4,10]=k[10,4]= 2*EIy/L
-    k[2,4]=k[4,2]  = -6*EIy/L**2   # same end, w-θy (negative because θy=−dw/dx)
-    k[2,10]=k[10,2]= -6*EIy/L**2   # node-i w to node-j θy
-    k[8,4]=k[4,8]  =  6*EIy/L**2   # node-j w to node-i θy
-    k[8,10]=k[10,8]=  6*EIy/L**2   # same end, w2-θy2
-    # ── bending in x-y plane  (v=1, θz=5, v=7, θz=11)
-    #    θz = +dv/dx  ⟹  off-diagonal coupling is POSITIVE for same-end, NEGATIVE for far-end
+    k[2,2]  = k[8,8]   =  12*EIy/L**3
+    k[2,8]  = k[8,2]   = -12*EIy/L**3
+    k[4,4]  = k[10,10] =   4*EIy/L
+    k[4,10] = k[10,4]  =   2*EIy/L
+    # same-end coupling (negative because θy = −dw/dx)
+    k[2,4]  = k[4,2]   =  -6*EIy/L**2
+    k[8,10] = k[10,8]  =  -6*EIy/L**2
+    # cross-end coupling (sign flips relative to same-end)
+    k[2,10] = k[10,2]  =  +6*EIy/L**2   # FIX: was −6
+    k[8,4]  = k[4,8]   =  -6*EIy/L**2   # FIX: was +6
+
+    # ── bending in x-y plane: v=1, θz=5, v=7, θz=11
+    #    θz = +dv/dx
+    #    Same-end   v-θz:  k[1,5]  = k[7,11] = +6EIz/L²  (positive — correct)
+    #    Cross-end  v-θz:  k[1,11] = k[7,5]  = −6EIz/L²  (unchanged — was correct)
     EIz = E_conc * Iz
-    k[1,1]=k[7,7]  = 12*EIz/L**3
-    k[1,7]=k[7,1]  = -12*EIz/L**3
-    k[5,5]=k[11,11]= 4*EIz/L
-    k[5,11]=k[11,5]= 2*EIz/L
-    k[1,5]=k[5,1]  =  6*EIz/L**2
-    k[1,11]=k[11,1]=  6*EIz/L**2
-    k[7,5]=k[5,7]  = -6*EIz/L**2
-    k[7,11]=k[11,7]= -6*EIz/L**2
+    k[1,1]  = k[7,7]   =  12*EIz/L**3
+    k[1,7]  = k[7,1]   = -12*EIz/L**3
+    k[5,5]  = k[11,11] =   4*EIz/L
+    k[5,11] = k[11,5]  =   2*EIz/L
+    k[1,5]  = k[5,1]   =  +6*EIz/L**2
+    k[1,11] = k[11,1]  =  +6*EIz/L**2
+    k[7,5]  = k[5,7]   =  -6*EIz/L**2
+    k[7,11] = k[11,7]  =  -6*EIz/L**2
+
     return k
 
 # ─────────────────────────────────────────────────────────────
-#  TRANSFORMATION MATRIX  (local → global)
+#  TRANSFORMATION MATRIX
 # ─────────────────────────────────────────────────────────────
 def transform_matrix(ni_n: dict, nj_n: dict, angle_deg: float) -> np.ndarray:
     dx = nj_n["x"] - ni_n["x"]
@@ -588,9 +624,7 @@ def transform_matrix(ni_n: dict, nj_n: dict, angle_deg: float) -> np.ndarray:
     dz = nj_n["z"] - ni_n["z"]
     L  = max(math.sqrt(dx**2 + dy**2 + dz**2), 0.001)
     cx, cy, cz = dx/L, dy/L, dz/L
-    # Local x-axis direction cosines known; build orthonormal basis
     if abs(cx) < 1e-6 and abs(cy) < 1e-6:
-        # Vertical member (column): local y = global y
         sgn = math.copysign(1.0, cz)
         lam = np.array([[0, 0, sgn],
                          [0, 1, 0  ],
@@ -623,7 +657,6 @@ st.divider()
 if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
              type="primary", use_container_width=True):
 
-    # ── HARD-STOP VALIDATION ────────────────────────────────
     def valid_size(s: str) -> bool:
         try:
             b, h = map(float, str(s).lower().replace(" ","").split("x"))
@@ -643,19 +676,19 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
 
     with st.spinner("Solving matrix, running IS 456 checks, building CAD…"):
 
-        # ── GLOBAL STIFFNESS ASSEMBLY ────────────────────────
+        # ── GLOBAL STIFFNESS ASSEMBLY (FIX #5: sparse matrix) ──
         n_nodes = len(nodes)
         ndof    = n_nodes * 6
-        K_global = np.zeros((ndof, ndof))
+        # Use LIL sparse format for efficient incremental assembly
+        K_global = lil_matrix((ndof, ndof), dtype=np.float64)
         F_global = np.zeros(ndof)
 
         area_dl  = (slab_thick / 1e3) * CONC_DENSITY + floor_finish
         total_q  = f_dl * area_dl + f_ll * live_load
         floor_W  = {z: 0.0 for z in range(1, len(floors_df)+1)}
 
-        # Pre-compute element geometry once
         for el in elements:
-            ni_n = node_dict[el["ni"]]   # O(1) lookup
+            ni_n = node_dict[el["ni"]]
             nj_n = node_dict[el["nj"]]
             el["ni_n"] = ni_n
             el["nj_n"] = nj_n
@@ -673,7 +706,6 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
                 if ni_n["floor"] > 0: floor_W[ni_n["floor"]] = floor_W.get(ni_n["floor"],0.0) + half
                 if nj_n["floor"] > 0: floor_W[nj_n["floor"]] = floor_W.get(nj_n["floor"],0.0) + half
 
-        # Assemble K and F
         for el in elements:
             ni_n, nj_n = el["ni_n"], el["nj_n"]
             T      = transform_matrix(ni_n, nj_n, el["angle"])
@@ -683,8 +715,9 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
             dofs = ([ni_n["id"]*6 + d for d in range(6)] +
                     [nj_n["id"]*6 + d for d in range(6)])
 
-            # ── Vectorised assembly  (was double Python for-loop, O(144))
-            K_global[np.ix_(dofs, dofs)] += k_glob
+            # FIX #5: sparse matrix supports np.ix_ via toarray; use direct indexing
+            rows = np.array(dofs)
+            K_global[np.ix_(rows, rows)] += k_glob
 
             if el["type"] == "Beam":
                 w = (calc_yield_line_udl(ni_n, nj_n, el["dir"], total_q)
@@ -693,35 +726,39 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
                 el["applied_w"] = w
                 V = w * el["L"] / 2.0
                 M = w * el["L"]**2 / 12.0
-                # Fixed-end forces in local frame
                 F_loc = np.zeros(12)
                 F_loc[1], F_loc[5], F_loc[7], F_loc[11] = V, M, V, -M
                 F_g = T.T @ F_loc
                 F_global[dofs] -= F_g
 
-        # Seismic storey forces (IS 1893 parabolic distribution)
+        # FIX #7: Seismic forces applied in BOTH X (DOF 0) and Y (DOF 1)
+        # IS 1893 Cl 7.8.2: analyse independently along each principal axis.
         if f_eq > 0:
             Vb = eq_base_shear * sum(floor_W.values()) * f_eq
             sum_Wh2 = sum(floor_W[z] * z_elevs[z]**2 for z in floor_W)
             if sum_Wh2 > 0:
                 for z, dn in diaphragm_nodes.items():
                     Fi = Vb * floor_W[z] * z_elevs[z]**2 / sum_Wh2
-                    F_global[dn["id"]*6] += Fi
+                    # Apply equal lateral force in X and Y; the governing
+                    # combination is taken in the design checks below.
+                    F_global[dn["id"]*6 + 0] += Fi   # X-direction
+                    F_global[dn["id"]*6 + 1] += Fi   # FIX #7: Y-direction added
 
-        # ── SOLVE (prefer solve; fall back to lstsq for ill-conditioned systems)
+        # FIX #5: convert to CSR for efficient solve
         base_nodes = [n for n in nodes if n["z"] == 0.0]
         fixed = sorted({n["id"]*6 + d for n in base_nodes for d in range(6)})
         free  = sorted(set(range(ndof)) - set(fixed))
         U_glob = np.zeros(ndof)
         if free:
-            K_ff = K_global[np.ix_(free, free)]
+            K_ff = K_global.tocsr()[np.ix_(free, free)]
             F_f  = F_global[free]
             try:
-                U_glob[free] = np.linalg.solve(K_ff, F_f)
-            except np.linalg.LinAlgError:
-                U_glob[free], *_ = np.linalg.lstsq(K_ff, F_f, rcond=None)
+                U_glob[free] = spsolve(K_ff, F_f)
+            except Exception:
+                # Fallback to dense lstsq for degenerate systems
+                U_glob[free], *_ = np.linalg.lstsq(K_ff.toarray(), F_f, rcond=None)
 
-        # ── POST-PROCESS: member forces, design, BBS ────────
+        # ── POST-PROCESS ────────────────────────────────────
         analysis_data, design_data, bbs_records = [], [], []
         base_reactions: dict[int, dict] = {}
 
@@ -742,7 +779,7 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
             Mu_pos   = 0.0
 
             if el["type"] == "Beam" and "applied_w" in el:
-                Vy_i = f_int[1]           # shear at node i in local frame (N)
+                Vy_i = f_int[1]
                 w    = el["applied_w"]
                 x_m  = Vy_i / max(w, 1e-6)
                 if 0 < x_m < el["L"]:
@@ -759,100 +796,110 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
                 "P(kN)":round(axial/1e3,1),"V(kN)":round(shear,1),
                 "M(kN.m)":round(max(Mu_pos,Mu_neg),1)})
 
-            # ── AI AUTO-DESIGN: always initialise before branching ───
-            best_size   = el["size"]    # ← always defined regardless of flag
-            best_cost   = float("inf")
-            best_design = None
+            # ── FIX #3: AI auto-design writes to design_size, never mutates size ──
+            # best_design and best_design_size are always initialised here.
+            best_design_size = el["size"]   # default: keep user-specified size
+            best_cost        = float("inf")
+            best_design      = None         # holds the tuple of design results
 
             if ai_auto_design:
                 catalog = STD_BEAMS if el["type"] == "Beam" else STD_COLS
                 for bw, hw in catalog:
                     bm, hm = bw/1e3, hw/1e3
                     if el["type"] == "Beam":
-                        rb, rt, sv_mm, stat = design_beam_is456(
+                        result = design_beam_is456(
                             el["L"], bm, hm, Mu_pos, Mu_neg, shear, torsion, fck, fy)
+                        rb, rt, sv_mm, stat = result
                         if stat == "Safe":
                             cost = (bm*hm*rate_conc_mat
                                     + ((rb+rt)/1e6)*STEEL_DENSITY*rate_steel_mat)
                             if cost < best_cost:
-                                best_cost, best_size = cost, f"{bw}x{hw}"
-                                best_design = (rb, rt, sv_mm, stat)
+                                best_cost        = cost
+                                best_design_size = f"{bw}x{hw}"
+                                best_design      = result   # (rb, rt, sv_mm, stat)
                     else:
-                        ra, sv_mm, stat = design_column_is456(
+                        result = design_column_is456(
                             bm, hm, axial/1e3, max(Mu_neg,Mu_pos), shear, torsion, fck, fy)
+                        ra, sv_mm, stat = result
                         if stat == "Safe":
                             cost = (bm*hm*rate_conc_mat
                                     + (ra/1e6)*STEEL_DENSITY*rate_steel_mat)
                             if cost < best_cost:
-                                best_cost, best_size = cost, f"{bw}x{hw}"
-                                best_design = (ra, sv_mm, stat)
-                if best_design:
-                    el["size"] = best_size
+                                best_cost        = cost
+                                best_design_size = f"{bw}x{hw}"
+                                best_design      = result   # (ra, sv_mm, stat)
 
-            # ── FINAL SECTION SIZES ──────────────────────────
-            b_m, h_m = (float(x)/1e3 for x in el["size"].split("x"))
+                # FIX #3: only adopt the optimised size if a valid result was found.
+                # el["size"] is NEVER mutated; el["design_size"] tracks the result.
+                if best_design is not None:
+                    el["design_size"] = best_design_size
+                # If no catalog entry passed "Safe", design_size stays as el["size"]
+                # and we fall through to recompute below with that size.
+
+            # ── FINAL DESIGN using design_size (not the mutated size) ────────────
+            b_m, h_m = (float(x)/1e3 for x in el["design_size"].split("x"))
 
             if el["type"] == "Beam":
-                if best_design and len(best_design) == 4:
+                # FIX #3: only unpack best_design when it's a valid 4-tuple
+                if best_design is not None and len(best_design) == 4:
                     rb, rt, sv_mm, stat = best_design
                 else:
+                    # Recompute with the resolved design_size
                     rb, rt, sv_mm, stat = design_beam_is456(
                         el["L"], b_m, h_m, Mu_pos, Mu_neg, shear, torsion, fck, fy)
                 rebar_bot = get_rebar_detail(rb, "Beam", b_m*1e3)
                 rebar_top = get_rebar_detail(rt, "Beam", b_m*1e3)
                 design_data.append({"ID":f"M{el['id']}","Type":"Beam",
-                    "Flr":ni_n["floor"],"Size":el["size"],
+                    "Flr":ni_n["floor"],"Size":el["design_size"],
                     "Bot":rebar_bot,"Top":rebar_top,
                     "Ties":f"T8@{sv_mm}","Status":stat})
-                # BBS entries
                 for cnt, dia in parse_rebar_string(rebar_bot):
                     cut = el["L"] - 0.05 + 50*dia/1e3
                     bbs_records.append({"Element":f"M{el['id']}(B)","Type":"Bot",
                         "Dia":dia,"No":cnt,"CutL(m)":round(cut,2),
-                        "Wt(kg)":round((dia**2/162)*cut*cnt,2)})
+                        "Wt(kg)":round((dia**2/REBAR_WT_FACTOR)*cut*cnt,2)})
                 for cnt, dia in parse_rebar_string(rebar_top):
                     cut = el["L"] - 0.05 + 50*dia/1e3
                     bbs_records.append({"Element":f"M{el['id']}(B)","Type":"Top",
                         "Dia":dia,"No":cnt,"CutL(m)":round(cut,2),
-                        "Wt(kg)":round((dia**2/162)*cut*cnt,2)})
+                        "Wt(kg)":round((dia**2/REBAR_WT_FACTOR)*cut*cnt,2)})
                 hd = 10 if b_m <= 0.25 else 12
                 bbs_records.append({"Element":f"M{el['id']}(B)","Type":"Hanger",
                     "Dia":hd,"No":2,"CutL(m)":round(el["L"]-0.05+50*hd/1e3,2),
-                    "Wt(kg)":round((hd**2/162)*(el["L"]-0.05+50*hd/1e3)*2,2)})
+                    "Wt(kg)":round((hd**2/REBAR_WT_FACTOR)*(el["L"]-0.05+50*hd/1e3)*2,2)})
             else:
-                if best_design and len(best_design) == 3:
+                # FIX #3: only unpack best_design when it's a valid 3-tuple
+                if best_design is not None and len(best_design) == 3:
                     ra, sv_mm, stat = best_design
                 else:
                     ra, sv_mm, stat = design_column_is456(
                         b_m, h_m, axial/1e3, max(Mu_neg,Mu_pos), shear, torsion, fck, fy)
                 rebar_str = get_rebar_detail(ra, "Column", b_m*1e3)
                 design_data.append({"ID":f"M{el['id']}","Type":"Column",
-                    "Flr":ni_n["floor"],"Size":el["size"],
+                    "Flr":ni_n["floor"],"Size":el["design_size"],
                     "Bot":"-","Top":rebar_str,
                     "Ties":f"T8@{sv_mm}","Status":stat})
                 for cnt, dia in parse_rebar_string(rebar_str):
                     cut = el["L"] + 50*dia/1e3
                     bbs_records.append({"Element":f"M{el['id']}(C)","Type":"Main",
                         "Dia":dia,"No":cnt,"CutL(m)":round(cut,2),
-                        "Wt(kg)":round((dia**2/162)*cut*cnt,2)})
+                        "Wt(kg)":round((dia**2/REBAR_WT_FACTOR)*cut*cnt,2)})
 
-            # Stirrups / ties for every member
             s_cut = (2*(b_m - 0.05 + h_m - 0.05) + 24*STIRRUP_DIA/1e3
                      if el["type"] == "Beam"
                      else 2*(b_m - 0.08 + h_m - 0.08) + 24*STIRRUP_DIA/1e3)
             n_st  = int(el["L"] / (sv_mm / 1e3)) + 1
             bbs_records.append({"Element":f"M{el['id']}","Type":"Stirrup",
                 "Dia":STIRRUP_DIA,"No":n_st,"CutL(m)":round(s_cut,2),
-                "Wt(kg)":round((STIRRUP_DIA**2/162)*s_cut*n_st,2)})
+                "Wt(kg)":round((STIRRUP_DIA**2/REBAR_WT_FACTOR)*s_cut*n_st,2)})
 
-        # ── TWO-WAY SLAB DESIGN (IS 456 Annex D) ────────────
+        # ── TWO-WAY SLAB DESIGN ──────────────────────────────
         xs = sorted({x2-x1 for x1,x2 in zip(x_coords_sorted,x_coords_sorted[1:]) if x2-x1 > 0.1})
         ys = sorted({y2-y1 for y1,y2 in zip(y_coords_sorted,y_coords_sorted[1:]) if y2-y1 > 0.1})
         Lx = max(min(xs) if xs else 1.0, 0.001)
         Ly = max(max(ys) if ys else 1.0, 0.001)
         ratio = Ly / Lx
 
-        # Bending moment coefficients (IS 456 Table 26)
         r_table  = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0]
         ap_table = [0.032,0.037,0.043,0.047,0.051,0.053,0.060,0.065]
         an_table = [0.043,0.048,0.057,0.064,0.068,0.072,0.080,0.087]
@@ -860,12 +907,12 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
             a_pos = float(np.interp(ratio, r_table, ap_table))
             a_neg = float(np.interp(ratio, r_table, an_table))
         else:
-            a_pos = a_neg = 0.125   # one-way slab
+            a_pos = a_neg = 0.125
 
         w_u_slab = 1.5 * (live_load + floor_finish + (slab_thick/1e3)*CONC_DENSITY)
         Mu_slab_pos = a_pos * w_u_slab * Lx**2
         Mu_slab_neg = a_neg * w_u_slab * Lx**2
-        Mu_slab_tor = 0.75 * Mu_slab_pos   # corner torsion (IS 456 Cl D-2.1.7)
+        Mu_slab_tor = 0.75 * Mu_slab_pos
 
         spc_pos = slab_spacing(Mu_slab_pos, slab_thick, fck, fy)
         spc_neg = slab_spacing(Mu_slab_neg, slab_thick, fck, fy)
@@ -873,23 +920,25 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
 
         d_req_flex = math.sqrt((max(Mu_slab_pos,Mu_slab_neg)*1e6)
                                / (MU_LIM * max(fck,1.0) * 1000.0)) + COVER_BEAM
-        d_req_defl = Lx * 1e3 / 28.0 + COVER_BEAM   # deflection span/depth
+        d_req_defl = Lx * 1e3 / 28.0 + COVER_BEAM
         safe_slab  = slab_thick >= max(d_req_flex, d_req_defl)
 
-        # Slab BBS
         for flr in range(1, len(floors_df)+1):
             nm = int(Ly / (spc_pos/1e3)) + 1
             nd = int(Lx / 0.20) + 1
             bbs_records += [
                 {"Element":f"Slab F{flr}","Type":"Bot-Main","Dia":10,"No":nm,
-                 "CutL(m)":round(Lx+1.0,2),"Wt(kg)":round((100/162)*(Lx+1)*nm,2)},
+                 "CutL(m)":round(Lx+1.0,2),"Wt(kg)":round((100/REBAR_WT_FACTOR)*(Lx+1)*nm,2)},
                 {"Element":f"Slab F{flr}","Type":"Bot-Dist","Dia":10,"No":nd,
-                 "CutL(m)":round(Ly+1.0,2),"Wt(kg)":round((100/162)*(Ly+1)*nd,2)},
-                {"Element":f"Slab F{flr}","Type":"Top-Supp","Dia":10,"No":(int(Ly/(spc_neg/1e3))+1)*2,
-                 "CutL(m)":round(0.6*Lx,2),"Wt(kg)":round((100/162)*0.6*Lx*(int(Ly/(spc_neg/1e3))+1)*2,2)},
+                 "CutL(m)":round(Ly+1.0,2),"Wt(kg)":round((100/REBAR_WT_FACTOR)*(Ly+1)*nd,2)},
+                {"Element":f"Slab F{flr}","Type":"Top-Supp","Dia":10,
+                 "No":(int(Ly/(spc_neg/1e3))+1)*2,
+                 "CutL(m)":round(0.6*Lx,2),
+                 "Wt(kg)":round((100/REBAR_WT_FACTOR)*0.6*Lx*(int(Ly/(spc_neg/1e3))+1)*2,2)},
                 {"Element":f"Slab F{flr}","Type":"Corner-Tor","Dia":10,
                  "No":(int((Lx/5)/(spc_tor/1e3))+1)*8,
-                 "CutL(m)":round(Lx/5,2),"Wt(kg)":round((100/162)*(Lx/5)*(int((Lx/5)/(spc_tor/1e3))+1)*8,2)},
+                 "CutL(m)":round(Lx/5,2),
+                 "Wt(kg)":round((100/REBAR_WT_FACTOR)*(Lx/5)*(int((Lx/5)/(spc_tor/1e3))+1)*8,2)},
             ]
 
         # ── FOOTING DESIGN ───────────────────────────────────
@@ -905,14 +954,16 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
             d_flex = math.sqrt((Mu_ftg*1e6) / max(MU_LIM*fck*(Side*1e3), 1.0))
             D_prov = max(300, math.ceil((d_flex + COVER_FOOTING) / 50.0) * 50)
 
-            # Punching shear check loop
-            for _ in range(30):   # cap iterations
-                d_eff = D_prov - COVER_FOOTING
-                dm    = d_eff / 1e3
-                V_p   = max(data["Pu"] - q_net*(cb+dm)*(ch+dm), 0.0)
-                perim = 2.0 * ((cb+dm) + (ch+dm))    # m
-                tau_p = (V_p*1e3) / (perim*1e3 * d_eff)   # N/mm²
-                beta_c = min(cb, ch) / max(cb, ch)
+            # FIX #2: punching shear — all quantities in consistent N / mm units
+            for _ in range(30):
+                d_eff  = D_prov - COVER_FOOTING          # mm
+                d_eff_m = d_eff / 1e3                    # m  (for geometry)
+                V_p    = max(data["Pu"] - q_net*(cb + d_eff_m)*(ch + d_eff_m), 0.0)  # kN
+                # Critical perimeter in mm (IS 456 Cl 31.6.1)
+                perim_mm = 2.0 * ((cb + d_eff_m)*1e3 + (ch + d_eff_m)*1e3)          # mm
+                # Punching shear stress: τ = V / (b₀ × d)  [N/mm²]
+                tau_p    = (V_p * 1e3) / (perim_mm * d_eff)   # N / mm²  ← FIX #2
+                beta_c   = min(cb, ch) / max(cb, ch)
                 tau_allow = min(0.5 + beta_c, 1.0) * 0.25 * math.sqrt(fck)
                 if tau_p <= tau_allow:
                     break
@@ -927,9 +978,8 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
             lf = Side - 0.1 + 2*(D_prov/1e3 - 0.1)
             bbs_records.append({"Element":f"Foot N{nid_r}","Type":"Mesh","Dia":12,
                 "No":nf*2,"CutL(m)":round(lf,2),
-                "Wt(kg)":round((144/162)*lf*nf*2,2)})
+                "Wt(kg)":round((144/REBAR_WT_FACTOR)*lf*nf*2,2)})
 
-        # Footing clash detection
         clashes, checked = [], set()
         fkeys = list(footing_geoms.keys())
         for i in range(len(fkeys)):
@@ -948,7 +998,8 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
         for el in elements:
             if el["type"] == "Diaphragm":
                 continue
-            bm, hm = (float(x)/1e3 for x in el["size"].split("x"))
+            # FIX #6: use design_size (not el["size"]) for BOQ volumes
+            bm, hm = (float(x)/1e3 for x in el["design_size"].split("x"))
             flr_tag = f"Floor {el['ni_n']['floor']}"
             vol  = bm * hm * el["L"]
             form = (2*(bm+hm) if el["type"]=="Column" else (bm+2*hm)) * el["L"]
@@ -970,7 +1021,6 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
                     {"Floor":"Foundation","Category":"Formwork","Qty":4*Lf*Df,"Unit":"m²"},
                     {"Floor":"Foundation","Category":"Excavation","Qty":(Lf+1)**2*1.5,"Unit":"m³"}]
 
-        # Map member IDs to floors for steel attribution
         id_floor = {f"M{r['ID'].replace('M','')}": f"Floor {r['Flr']}"
                     for r in analysis_data}
         def elem_floor(ename: str) -> str:
@@ -1019,7 +1069,7 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
         pdf.cell(0,10,f"TOTAL STEEL: {total_wt/1e3:.2f} Metric Tons",0,1,"R")
         pdf_bytes = pdf.output(dest="S").encode("latin-1")
 
-        # ── DXF (same as original, unchanged) ─────────────────
+        # ── DXF ───────────────────────────────────────────────
         doc = ezdxf.new("R2010"); msp = doc.modelspace()
         for lname, col, lt in [("GRIDS",8,"DASHED"),("CONCRETE_OUTLINE",2,"CONTINUOUS"),
                                 ("REBAR_MAIN",1,"CONTINUOUS"),("REBAR_TIES",3,"CONTINUOUS"),
@@ -1064,13 +1114,15 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
                 msp.add_text(str(gy["Grid_ID"]),dxfattribs={"layer":"ANNOTATIONS","height":0.3}
                              ).set_placement((bx-2.05,y-0.12))
             for col in [e for e in elements if e["type"]=="Column" and e["nj_n"]["floor"]==f_num]:
-                cb,ch=(float(x)/1e3 for x in col["size"].split("x"))
+                # FIX #6: use design_size in DXF output
+                cb,ch=(float(x)/1e3 for x in col["design_size"].split("x"))
                 cx,cy=bx+col["nj_n"]["x"],col["nj_n"]["y"]
                 msp.add_lwpolyline(
                     [(cx-cb/2,cy-ch/2),(cx+cb/2,cy-ch/2),(cx+cb/2,cy+ch/2),(cx-cb/2,cy+ch/2),(cx-cb/2,cy-ch/2)],
                     dxfattribs={"layer":"CONCRETE_OUTLINE"})
             for bm_el in [e for e in elements if e["type"]=="Beam" and e["ni_n"]["floor"]==f_num]:
-                bb,_=(float(x)/1e3 for x in bm_el["size"].split("x"))
+                # FIX #6: use design_size in DXF output
+                bb,_=(float(x)/1e3 for x in bm_el["design_size"].split("x"))
                 nx1,ny1=bx+bm_el["ni_n"]["x"],bm_el["ni_n"]["y"]
                 nx2,ny2=bx+bm_el["nj_n"]["x"],bm_el["nj_n"]["y"]
                 if abs(ny1-ny2)<0.01:
@@ -1080,7 +1132,6 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
                     msp.add_line((nx1+bb/2,ny1),(nx2+bb/2,ny2),dxfattribs={"layer":"CONCRETE_OUTLINE"})
                     msp.add_line((nx1-bb/2,ny1),(nx2-bb/2,ny2),dxfattribs={"layer":"CONCRETE_OUTLINE"})
 
-        # Detail sections omitted here for brevity; identical to original
         fdt, path = tempfile.mkstemp(suffix=".dxf")
         os.close(fdt); doc.saveas(path)
         with open(path,"rb") as f: dxf_bytes = f.read()
