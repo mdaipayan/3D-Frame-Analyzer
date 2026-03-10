@@ -6,6 +6,22 @@ import math
 import os
 import tempfile
 from fpdf import FPDF
+
+# ─── PDF SAFE HELPER ─────────────────────────────────────────────────────────
+# fpdf 1.x uses latin-1 internally; translate every non-latin-1 char to ASCII.
+_PDF_MAP = str.maketrans({
+    'τ': 'tau',   'φ': 'phi',   'α': 'alpha', 'θ': 'theta',
+    '√': 'sqrt',  'π': 'pi',    '≤': '<=',    '≥': '>=',
+    '≈': '~',     '²': '2',     '³': '3',     '×': 'x',
+    '₹': 'Rs.',   '·': '.',     '—': '-',     '–': '-',
+    '±': '+/-',   '→': '->',    '≠': '!=',    '°': 'deg',
+    '′': "'",     '″': '"',
+})
+def pdf_safe(s: str) -> str:
+    """Strip/replace chars outside latin-1 so fpdf never raises UnicodeEncodeError."""
+    s = str(s).translate(_PDF_MAP)
+    return s.encode('latin-1', errors='replace').decode('latin-1')
+
 import ezdxf
 from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import spsolve
@@ -76,7 +92,7 @@ active_key = mapping[csv_choice]
 st.sidebar.download_button(
     f"⬇️ Download {csv_choice} (CSV)",
     data=st.session_state[active_key].to_csv(index=False).encode(),
-    file_name=f"{active_key}_template.csv", mime="text/csv", use_container_width=True)
+    file_name=f"{active_key}_template.csv", mime="text/csv", width='stretch')
 
 uploaded_csv = st.sidebar.file_uploader(f"⬆️ Upload {csv_choice} (CSV)", type=["csv"])
 if uploaded_csv and st.session_state.last_uploaded.get(csv_choice) != uploaded_csv.name:
@@ -160,10 +176,10 @@ with st.sidebar.expander("Modify Rates", expanded=False):
 # ─────────────────────────────────────────────────────────────
 with st.expander("📐 Building Grids & Geometry", expanded=False):
     c1, c2, c3, c4 = st.columns(4)
-    with c1: st.write("Z-Elevations");  floors_df  = st.data_editor(st.session_state.floors,  num_rows="dynamic", use_container_width=True)
-    with c2: st.write("X-Grids");       x_grids_df = st.data_editor(st.session_state.x_grids, num_rows="dynamic", use_container_width=True)
-    with c3: st.write("Y-Grids");       y_grids_df = st.data_editor(st.session_state.y_grids, num_rows="dynamic", use_container_width=True)
-    with c4: st.write("Columns");       cols_df    = st.data_editor(st.session_state.cols,    num_rows="dynamic", use_container_width=True)
+    with c1: st.write("Z-Elevations");  floors_df  = st.data_editor(st.session_state.floors,  num_rows="dynamic", width='stretch')
+    with c2: st.write("X-Grids");       x_grids_df = st.data_editor(st.session_state.x_grids, num_rows="dynamic", width='stretch')
+    with c3: st.write("Y-Grids");       y_grids_df = st.data_editor(st.session_state.y_grids, num_rows="dynamic", width='stretch')
+    with c4: st.write("Columns");       cols_df    = st.data_editor(st.session_state.cols,    num_rows="dynamic", width='stretch')
 
 x_coords_sorted = sorted({float(r["X_Coord (m)"]) for _, r in x_grids_df.iterrows()})
 y_coords_sorted = sorted({float(r["Y_Coord (m)"]) for _, r in y_grids_df.iterrows()})
@@ -226,12 +242,12 @@ with st.expander("📡 IS 1893 Seismic Coefficient (auto-computed)", expanded=Fa
 class PDFReport(FPDF):
     def header(self):
         self.set_font("Arial","B",14)
-        self.cell(0,8,"STRUCTURAL DETAILING REPORT",border=1,ln=1,align="C")
+        self.cell(0,8,pdf_safe("STRUCTURAL DETAILING REPORT"),border=1,ln=1,align="C")
         self.set_font("Arial","I",10)
-        self.cell(0,6,"IS 456:2000 | IS 1893:2016 | SP-34",border=1,ln=1,align="C")
+        self.cell(0,6,pdf_safe("IS 456:2000 | IS 1893:2016 | SP-34"),border=1,ln=1,align="C")
         self.ln(2)
         self.set_font("Arial","B",11)
-        self.cell(0,8,"Structural Engineer: Mr. D. Mandal, M.Tech. Structures",ln=1,align="R")
+        self.cell(0,8,pdf_safe("Structural Engineer: Mr. D. Mandal, M.Tech. Structures"),ln=1,align="R")
         self.line(10,self.get_y(),200,self.get_y()); self.ln(5)
     def footer(self):
         self.set_y(-15); self.set_font("Arial","I",8)
@@ -239,15 +255,15 @@ class PDFReport(FPDF):
     def chapter_title(self,title):
         self.set_font("Arial","B",12)
         self.set_fill_color(200,220,255)
-        self.cell(0,8,title,0,1,"L",True); self.ln(4)
+        self.cell(0,8,pdf_safe(title),0,1,"L",True); self.ln(4)
     def build_table(self,df):
         self.set_font("Arial","B",8)
         cw = min(190 / max(len(df.columns), 1), 40)
-        for col in df.columns: self.cell(cw,6,str(col)[:14],border=1,align="C")
+        for col in df.columns: self.cell(cw,6,pdf_safe(str(col))[:14],border=1,align="C")
         self.ln()
         self.set_font("Arial","",8)
         for _,row in df.iterrows():
-            for v in row: self.cell(cw,6,str(v)[:14],border=1,align="C")
+            for v in row: self.cell(cw,6,pdf_safe(str(v))[:14],border=1,align="C")
             self.ln()
         self.ln(5)
 
@@ -695,7 +711,7 @@ if show_nodes:
         showlegend=False, hoverinfo="none"))
 fig.update_layout(scene=dict(xaxis_title="X",yaxis_title="Y",zaxis_title="Z",
     aspectmode="data"), margin=dict(l=0,r=0,b=0,t=0), height=500)
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width='stretch')
 
 # ─────────────────────────────────────────────────────────────
 #  YIELD-LINE TRIBUTARY UDL
@@ -830,7 +846,7 @@ st.divider()
 #  MAIN ANALYSIS BUTTON
 # ─────────────────────────────────────────────────────────────
 if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
-             type="primary", use_container_width=True):
+             type="primary", width='stretch'):
 
     def valid_size(s: str) -> bool:
         try:
@@ -1161,7 +1177,7 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
             d_eff   = D_prov - COVER_FOOTING
             ftg_spc = slab_spacing(Mu_ftg / Side, D_prov, fck, fy, dia=12)
             footing_results.append({"Node":f"N{nid_r}","P(kN)":round(data["Pu"],1),
-                "Size":f"{Side}×{Side}m","D(mm)":D_prov,
+                "Size":f"{Side}x{Side}m","D(mm)":D_prov,
                 "Mesh":f"T12@{ftg_spc}",
                 "τ_punch(N/mm²)":round(tau_p,3),"τ_allow":round(tau_allow,3)})
             nf = int((Side - 0.1) / (ftg_spc/1e3)) + 1
@@ -1204,7 +1220,7 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
                      "Qty":tot_plan,"Unit":"m²"}]
 
         for fr in footing_results:
-            raw_side = fr["Size"].split("×")[0]
+            raw_side = fr["Size"].split("x")[0]
             Lf = float(raw_side)
             Df = fr["D(mm)"]/1e3
             est += [{"Floor":"Foundation","Category":"Concrete","Qty":Lf*Lf*Df,"Unit":"m³"},
@@ -1259,7 +1275,7 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
         pdf.build_table(pd.DataFrame(footing_results))
         pdf.chapter_title("3. TWO-WAY SLAB (IS 456 Annex D)")
         pdf.build_table(pd.DataFrame([{
-            "Panel":f"{Lx:.2f}m×{Ly:.2f}m","Thick":f"{slab_thick}mm",
+            "Panel":f"{Lx:.2f}m x {Ly:.2f}m","Thick":f"{slab_thick}mm",
             "Ly/Lx":round(ratio,2),
             "Bot Span":f"T10@{spc_pos}","Top Hog":f"T10@{spc_neg}","Corner":f"T10@{spc_tor}",
             "l/d Basic":ld_basic_slab,"d_req(mm)":round(max(d_req_flex,d_req_defl),0)}]))
@@ -1267,7 +1283,7 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
         pdf.build_table(df_bbs)
         pdf.set_font("Arial","B",12)
         total_wt = df_bbs["Wt(kg)"].sum()
-        pdf.cell(0,10,f"TOTAL STEEL: {total_wt/1e3:.2f} Metric Tons",0,1,"R")
+        pdf.cell(0,10,pdf_safe(f"TOTAL STEEL: {total_wt/1e3:.2f} Metric Tons"),0,1,"R")
         pdf_bytes = pdf.output(dest="S").encode("latin-1")
 
         # ── DXF ───────────────────────────────────────────────
@@ -1341,17 +1357,17 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
         st.success("✅ Analysis, design, CAD & estimate complete!")
         c1, c2 = st.columns(2)
         with c1: st.download_button("📄 Download PDF Report", pdf_bytes,
-            "Structural_Report.pdf","application/pdf",type="primary",use_container_width=True)
+            "Structural_Report.pdf","application/pdf",type="primary", width='stretch')
         with c2: st.download_button("📥 Download CAD (.dxf)", dxf_bytes,
-            "Framing_Plans.dxf","application/dxf",type="primary",use_container_width=True)
+            "Framing_Plans.dxf","application/dxf",type="primary", width='stretch')
 
         t1,t2,t3,t4,t5,t6 = st.tabs([
             "📊 Forces","📐 Detailing","🟦 Slabs & Footings","🧾 BBS","💰 BOQ","📡 Seismic"])
 
         with t1:
-            st.dataframe(pd.DataFrame(analysis_data), use_container_width=True)
+            st.dataframe(pd.DataFrame(analysis_data), width='stretch')
         with t2:
-            st.dataframe(pd.DataFrame(design_data), use_container_width=True)
+            st.dataframe(pd.DataFrame(design_data), width='stretch')
         with t3:
             st.markdown(
                 f"**Panel:** {Lx:.2f} m × {Ly:.2f} m &nbsp;|&nbsp; "
@@ -1368,19 +1384,19 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
             st.divider()
             if not clashes: st.success("✅ No footing clashes.")
             else:           st.error(f"🚨 {len(clashes)} footing clash(es) — use combined/raft.")
-            st.dataframe(pd.DataFrame(footing_results), use_container_width=True)
+            st.dataframe(pd.DataFrame(footing_results), width='stretch')
         with t4:
-            st.dataframe(df_bbs, use_container_width=True)
+            st.dataframe(df_bbs, width='stretch')
             st.metric("Total Steel", f"{df_bbs['Wt(kg)'].sum()/1e3:.2f} t")
             st.download_button("⬇️ BBS CSV", df_bbs.to_csv(index=False),
-                "bbs.csv","text/csv",use_container_width=True)
+                "bbs.csv","text/csv", width='stretch')
         with t5:
-            st.dataframe(df_est, use_container_width=True)
+            st.dataframe(df_est, width='stretch')
             df_abs = df_est.groupby("Floor")[["MatCost(₹)","LabCost(₹)","TotalCost(₹)"]].sum().reset_index()
-            st.dataframe(df_abs, use_container_width=True)
+            st.dataframe(df_abs, width='stretch')
             st.metric("Grand Total", f"₹ {df_abs['TotalCost(₹)'].sum():,.0f}")
             st.download_button("⬇️ Estimate CSV", df_est.to_csv(index=False),
-                "estimate.csv","text/csv",use_container_width=True)
+                "estimate.csv","text/csv", width='stretch')
         with t6:
             st.subheader("IS 1893:2016 Seismic Design Summary")
             sc1,sc2,sc3,sc4,sc5 = st.columns(5)
@@ -1405,7 +1421,7 @@ if st.button("🚀 Execute Analysis, Generate CAD/PDF & Estimates",
                         "Floor":z, "Wi(kN)":round(floor_W[z],1),
                         "hi(m)":round(z_elevs[z],2),
                         "Fi(kN)":round(Fi,1)})
-                st.dataframe(pd.DataFrame(floor_force_data), use_container_width=True)
+                st.dataframe(pd.DataFrame(floor_force_data), width='stretch')
                 st.metric("Total Base Shear Vb", f"{Vb_disp:.1f} kN")
             else:
                 st.info("No seismic load in selected combination.")
